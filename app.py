@@ -4,6 +4,7 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from datetime import datetime
 from dotenv import load_dotenv
+from urllib.parse import quote  # ← 追加
 
 # .env 読み込み
 load_dotenv()
@@ -13,7 +14,6 @@ app = Flask(__name__)
 # ===== Azure OAuth / Graph 設定 =====
 CLIENT_ID = os.getenv("CLIENT_ID") or os.getenv("AZURE_CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET") or os.getenv("AZURE_CLIENT_SECRET")
-# テナントは common でも、固定の TENANT_ID でもOK
 TENANT = os.getenv("AZURE_TENANT", "common")
 REDIRECT_URI = os.getenv("AZURE_REDIRECT_URI", "http://localhost:5000/callback")
 SCOPE = "offline_access Files.ReadWrite"
@@ -82,7 +82,8 @@ def ensure_folder(path: str):
     parent = "root"
     headers = {"Authorization": f"Bearer {TOKENS['access_token']}"}
     for seg in segs:
-        url = f"{GRAPH}/me/drive/{parent}/children?$filter=name eq '{seg}'"
+        quoted_name = quote(f'"{seg}"')  # ← "test-eml" を URLエンコード
+        url = f"{GRAPH}/me/drive/{parent}/children?$filter=name eq {quoted_name}"
         r = requests.get(url, headers=headers, timeout=20)
         r.raise_for_status()
         items = r.json().get("value", [])
@@ -91,7 +92,7 @@ def ensure_folder(path: str):
         else:
             create = f"{GRAPH}/me/drive/{parent}/children"
             payload = {"name": seg, "folder": {}, "@microsoft.graph.conflictBehavior": "rename"}
-            cr = requests.post(create, headers={**headers, "Content-Type":"application/json"},
+            cr = requests.post(create, headers={**headers, "Content-Type": "application/json"},
                                json=payload, timeout=20)
             cr.raise_for_status()
             parent = f"items/{cr.json()['id']}"
