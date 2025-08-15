@@ -149,7 +149,7 @@
 #     return "OK"
 
 
-import os, time, json, requests
+import os, time, json, base64, requests
 from flask import Flask, request, jsonify, redirect
 from email.message import EmailMessage
 from email.utils import formatdate
@@ -157,17 +157,19 @@ from datetime import datetime
 from dotenv import load_dotenv
 from urllib.parse import quote
 
-# .env
+# .env 読み込み
 load_dotenv()
 
 app = Flask(__name__)
 
 # ===== Azure OAuth / Graph 設定 =====
+# CLIENT_ID/SECRET がなければ AZURE_CLIENT_ID/SECRET を読む（どちらか片方に統一推奨）
 CLIENT_ID = os.getenv("CLIENT_ID") or os.getenv("AZURE_CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET") or os.getenv("AZURE_CLIENT_SECRET")
-TENANT = os.getenv("AZURE_TENANT", "common")
+TENANT = os.getenv("AZURE_TENANT", "common")  # 個人固定したい場合は 'consumers' をENVで設定
 REDIRECT_URI = os.getenv("AZURE_REDIRECT_URI", "http://localhost:5000/callback")
 SCOPE = "offline_access Files.ReadWrite"
+
 GRAPH = "https://graph.microsoft.com/v1.0"
 AUTHZ = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/authorize"
 TOKEN = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
@@ -177,7 +179,7 @@ DEFAULT_SAVE_DIR = os.getenv("DEFAULT_SAVE_DIR", "/AI/answers")
 # 任意（/token/export用の簡易保護）
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 
-# ===== トークン（無料運用：refresh_token は環境変数から） =====
+# ===== トークン（無料運用：refresh_token は環境変数から読込。保存はしない） =====
 TOKENS = {
     "access_token": None,
     "refresh_token": os.getenv("REFRESH_TOKEN"),
@@ -215,11 +217,13 @@ def refresh_if_needed():
 # ===== OAuth =====
 @app.get("/login")
 def login():
+    # 事故防止のため毎回アカウント選択を強制。個人寄せしたいときは domain_hint=consumers。
     url = (
         f"{AUTHZ}?client_id={CLIENT_ID}"
         f"&response_type=code"
         f"&redirect_uri={quote(REDIRECT_URI, safe='')}"
         f"&scope={quote(SCOPE, safe=' ')}"
+        f"&prompt=select_account&domain_hint=consumers"
     )
     return redirect(url)
 
@@ -246,9 +250,15 @@ def callback():
     <h3>OAuth OK</h3>
     <p>Render の Environment に <code>REFRESH_TOKEN</code> として保存してね。</p>
     <pre style="white-space: pre-wrap;">{rt}</pre>
-    <p>保存後に再起動すると以後は自動更新（90日未使用で失効）。</p>
+    <p>保存後にサービス再起動すると、以後は自動更新（ただし90日未使用で失効）。</p>
     """
     return html, 200
+
+@app.get("/logout")
+def logout():
+    """手動でトークンを破棄（無料版ではメモリのみ）"""
+    TOKENS.update({"access_token": None, "refresh_token": None, "exp": 0})
+    return jsonify({"ok": True, "message": "Tokens cleared. Please re-login via /login."})
 
 @app.get("/token/export")
 def token_export():
@@ -271,7 +281,7 @@ def warmup():
 def ensure_folder(path: str):
     """
     /me/drive/{parent}:/{child} で存在確認→なければ /children で作成。
-    ここでは例外を投げず呼び出し側で扱えるように辞書で返す。
+    ここでは例外を投げず辞書で返す（呼び出し側でJSON化して返せるように）。
     """
     if not path or path == "/":
         return {"ok": True}
@@ -370,8 +380,7 @@ def upload_eml():
 def health():
     return "OK"
 
-
-# === 追加：診断用エンドポイント ===
+# === 診断：どこに向いてるか（個人/組織） ===
 @app.get("/diag")
 def diag():
     try:
@@ -387,13 +396,31 @@ def diag():
         "ok": me.ok and drive.ok,
         "me_status": me.status_code,
         "drive_status": drive.status_code,
-        "me": me.json() if me.ok else me.text,
-        "drive": drive.json() if drive.ok else drive.text
+        "drive_type": (drive.json().get("driveType") if drive.ok else None),
+        "me_tenant": (me.json().get("userPrincipalName") if me.ok else None)
     }
     return jsonify(info), (200 if info["ok"] else 400)
 
-@app.get("/logout")
-def logout():
-    """手動でトークンを破棄（無料版ではメモリだけ）"""
-    TOKENS.update({"access_token": None, "refresh_token": None, "exp": 0})
-    return jsonify({"ok": True, "message": "Tokens cleared. Please re-login via /login."})
+# === 診断：アクセストークンのテナントID（tid）を見る ===
+def _jwt_parts(token: str):
+    try:
+        head, payload, _ = token.split(".")
+        pad = lambda s: s + "=" * (-len(s) % 4)
+        return (json.loads(base64.urlsafe_b64decode(pad(head)).decode()),
+                json.loads(base64.urlsafe_b64decode(pad(payload)).decode()))
+    except Exception as e:
+        return None, {"error": str(e)}
+
+@app.get("/tokeninfo")
+def tokeninfo():
+    try:
+        refresh_if_needed()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 401
+    h, p = _jwt_parts(TOKENS["access_token"])
+    return jsonify({
+        "ok": True,
+        "tid": p.get("tid"),
+        "upn": p.get("upn") or p.get("preferred_username"),
+        "note": "tid == 9188040d-6c67-4c5b-b112-36a304b66dad なら個人(MSA)テナント"
+    })
