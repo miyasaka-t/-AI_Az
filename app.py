@@ -369,3 +369,25 @@ def upload_eml():
 @app.get("/")
 def health():
     return "OK"
+
+
+# === 追加：診断用エンドポイント ===
+@app.get("/diag")
+def diag():
+    try:
+        refresh_if_needed()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 401
+
+    hdrs = {"Authorization": f"Bearer {TOKENS['access_token']}"}
+    me = requests.get(f"{GRAPH}/me", headers=hdrs, timeout=20)
+    drive = requests.get(f"{GRAPH}/me/drive", headers=hdrs, timeout=20)
+
+    info = {
+        "ok": me.ok and drive.ok,
+        "me_status": me.status_code,
+        "drive_status": drive.status_code,
+        "me": me.json() if me.ok else me.text,
+        "drive": drive.json() if drive.ok else drive.text
+    }
+    return jsonify(info), (200 if info["ok"] else 400)
