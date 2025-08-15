@@ -391,3 +391,9 @@ def diag():
         "drive": drive.json() if drive.ok else drive.text
     }
     return jsonify(info), (200 if info["ok"] else 400)
+
+@app.get("/logout")
+def logout():
+    """手動でトークンを破棄（無料版ではメモリだけ）"""
+    TOKENS.update({"access_token": None, "refresh_token": None, "exp": 0})
+    return jsonify({"ok": True, "message": "Tokens cleared. Please re-login via /login."})
