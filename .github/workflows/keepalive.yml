@@ -1,0 +1,19 @@
+name: KeepAlive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 10分おき（UTC）
+  workflow_dispatch: {}       # 手動実行ボタンも出す
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Hit Render health endpoint
+        env:
+          TARGET_URL: "https://ai-az.onrender.com/"
+        run: |
+          echo "Pinging $TARGET_URL"
+          curl -fsSL "$TARGET_URL" --max-time 20 >/dev/null
+          echo "OK"
