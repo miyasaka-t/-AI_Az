@@ -814,8 +814,11 @@
 #     except Exception as e:
 #         return jsonify({"error": str(e)}), 400
 
+
+
 #＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
-import os, time, json, base64, secrets, requests
+
+import os, time, json, base64, secrets, requests, html as _html
 from flask import Flask, request, jsonify, redirect, make_response
 from flask_cors import CORS
 from email.message import EmailMessage
@@ -914,6 +917,19 @@ def logout():
 def health():
     return "OK"
 
+# ===== テキスト -> HTML 自動変換（段落/改行保持） =====
+def _text_to_html(s: str) -> str:
+    if not s:
+        return "<p></p>"
+    # 正規化してHTMLエスケープ
+    t = (_html.escape(s or "")
+         .replace("\r\n", "\n")
+         .replace("\r", "\n"))
+    # 段落は空行で区切り、改行は <br> に
+    paras = t.split("\n\n")
+    html_body = "".join(f"<p>{p.replace('\n','<br>')}</p>" for p in paras)
+    return html_body or "<p></p>"
+
 # ===== EML生成 =====
 def build_eml_bytes(subject, from_addr, to_addrs, body_text="", body_html=None, date_str=None) -> bytes:
     msg = EmailMessage()
@@ -921,16 +937,22 @@ def build_eml_bytes(subject, from_addr, to_addrs, body_text="", body_html=None, 
     msg["From"] = from_addr or "noreply@example.com"
     msg["To"] = ", ".join(to_addrs) if isinstance(to_addrs, list) else (to_addrs or "")
     msg["Date"] = date_str or formatdate(localtime=True)
+
+    # 常に text/plain は入れる
+    msg.set_content(body_text or "", subtype="plain", charset="utf-8")
+
+    # HTML が無ければ text から自動生成
+    if body_html is None or body_html is False:
+        body_html = _text_to_html(body_text or "")
+
+    # HTML ありなら multipart/alternative で追加
     if body_html:
-        msg.set_content(body_text or "", subtype="plain", charset="utf-8")
         msg.add_alternative(body_html, subtype="html", charset="utf-8")
-    else:
-        msg.set_content(body_text or "", subtype="plain", charset="utf-8")
+
     return msg.as_bytes()
 
 # ===== チケット管理（メモリ／短命） =====
 TICKETS = {}  # tid -> dict
-
 def _now(): return int(time.time())
 
 def issue_ticket(file_name: str, mime: str, payload: dict, ttl_sec: int = 600, once: bool = True):
@@ -1034,12 +1056,18 @@ def materialize_bytes(meta: dict) -> bytes:
         r.raise_for_status()
         return r.content
     if t == "eml":
+        # text が本文の正。html が無い or htmlFromText==true なら text から自動生成
+        body_text = p.get("text", "") or ""
+        html_from_text = bool(p.get("htmlFromText"))  # 任意フラグ
+        body_html = p.get("html")
+        if html_from_text or body_html in (None, False, ""):
+            body_html = _text_to_html(body_text)
         return build_eml_bytes(
             subject=p.get("subject"),
             from_addr=p.get("from"),
             to_addrs=p.get("to") or ["user@example.com"],
-            body_text=p.get("text", ""),
-            body_html=p.get("html"),
+            body_text=body_text,
+            body_html=body_html,
             date_str=p.get("date")
         )
     raise RuntimeError(f"unsupported payload.type: {t}")
@@ -1114,3 +1142,4 @@ def api_upload():
             return jsonify({"error": "graph upload failed", "status": r.status_code, "detail": r.text}), r.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
