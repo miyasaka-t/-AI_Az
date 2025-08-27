@@ -1,0 +1,169 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>OneDrive（個人）に保存</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body { font:14px/1.6 system-ui; max-width:780px; margin:24px auto; }
+  .row { display:flex; gap:8px; margin:10px 0; align-items:center; flex-wrap:wrap; }
+  input[type=text]{ flex:1; padding:8px; }
+  button { padding:10px 12px; border:1px solid #ccc; border-radius:10px; cursor:pointer; }
+  #log { white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:12px; min-height:80px;}
+</style>
+
+<h1>OneDrive（個人）に保存</h1>
+<p>1) 保存先フォルダを選んで → 2) アップロード を押してください。</p>
+
+<div class="row">
+  <label>ファイル名</label>
+  <input id="name" type="text" placeholder="Report.txt">
+</div>
+
+<div class="row">
+  <button id="pick">📁 保存先フォルダを選ぶ</button>
+  <span id="pickedHint"></span>
+</div>
+
+<div class="row">
+  <button id="upload" disabled>⬆ アップロード</button>
+</div>
+
+<h3>ログ</h3>
+<pre id="log"></pre>
+
+<!-- OneDrive File Picker v7.2 -->
+<script src="https://js.live.net/v7.2/OneDrive.js"></script>
+<script>
+const q = new URLSearchParams(location.search);
+const TICKET  = q.get("ticket") || "";
+const SUGGEST = q.get("suggest") || "download.txt";
+document.getElementById("name").value = SUGGEST;
+
+// ★本番値（RenderのFlask URL と OneDrive PickerのアプリID）
+const RENDER_BASE = "https://ai-az.onrender.com";                 // ← 指定どおり固定
+const FRONT_CLIENT_ID = "YOUR_ONEDRIVE_PICKER_APP_ID";            // ← あなたのアプリIDに置換
+const RENDER_UPLOAD_ENDPOINT = RENDER_BASE + "/api/upload";
+const RENDER_PEEK_ENDPOINT   = RENDER_BASE + "/tickets/peek";
+
+let pickedFolderId = null;
+let payloadType = "text"; // peekで上書き予定
+
+const log  = (m)=> document.getElementById("log").textContent += m + "\n";
+const hint = (m)=> document.getElementById("pickedHint").textContent = m;
+
+// 1) 初期表示時に /tickets/peek でサーバ側ファイル名を参照し、入力欄に反映
+(async function initNameFromPeek(){
+  if (!TICKET) { log("⚠ ticket がクエリになく初期名は suggest のままです"); return; }
+  try {
+    const r = await fetch(RENDER_PEEK_ENDPOINT + "?ticket=" + encodeURIComponent(TICKET));
+    const j = await r.json();
+    if (!r.ok) { log("peek失敗: " + (j.error || r.statusText)); return; }
+    payloadType = (j.type || "text").toLowerCase();
+
+    const current = document.getElementById("name").value.trim();
+    const isDefaultSuggest = (SUGGEST === "download.txt" || current === "" || current === SUGGEST);
+
+    // デフォルト suggest なら、peek の fileName を優先
+    if (isDefaultSuggest && j.fileName) {
+      document.getElementById("name").value = j.fileName;
+    }
+
+    // eml の場合は念のため拡張子を整える
+    if (payloadType === "eml") {
+      const nm = document.getElementById("name").value.trim() || "message.eml";
+      document.getElementById("name").value = nm.toLowerCase().endsWith(".eml") ? nm : (nm + ".eml");
+    }
+  } catch (e) {
+    log("peek例外: " + e.message);
+  }
+})();
+
+// 2) フォルダ選択
+document.getElementById("pick").onclick = () => {
+  if (!FRONT_CLIENT_ID) { alert("FRONT_CLIENT_ID が未設定です"); return; }
+  const odOptions = {
+    clientId: FRONT_CLIENT_ID,
+    action: "query",           // メタデータ（ID）取得
+    viewType: "folders",       // フォルダのみ
+    multiSelect: false,
+    openInNewWindow: true,
+    advanced: {
+      endpointHint: "api.onedrive.com",
+      // redirectUri: location.origin + "/picker-redirect.html" // 必要時に設定
+    },
+    success: async function(res) {
+      const it = (res.value && res.value[0]) || null;
+      if (!it || !it.id || !it.folder) { log("❌ フォルダが選択されませんでした"); return; }
+      pickedFolderId = it.id; // /me/drive/items/{id} の {id}
+
+      // Graph API で name/webUrl を引く（必ずフォルダ名を表示したい）
+      let label = "";
+      try {
+        const r = await fetch(RENDER_BASE + "/api/drive/item?id=" + encodeURIComponent(it.id));
+        const meta = await r.json();
+        if (r.ok && meta.name) {
+          label = meta.name;
+          // 任意：ログに開くリンク
+          if (meta.webUrl) {
+            const a = document.createElement("a");
+            a.href = meta.webUrl; a.textContent = "選択フォルダをOneDriveで開く"; a.target = "_blank";
+            document.getElementById("log").appendChild(a);
+            document.getElementById("log").appendChild(document.createTextNode("\n"));
+          }
+        } else {
+          label = "ID:" + String(it.id).slice(0, 8) + "…";
+        }
+      } catch (e) {
+        label = "ID:" + String(it.id).slice(0, 8) + "…";
+      }
+
+      hint("選択中: " + label);
+      log("Pick OK: folderId=" + pickedFolderId);
+      document.getElementById("upload").disabled = false;
+    },
+    cancel: function(){ log("キャンセルされました"); },
+    error: function(e){ log("エラー: " + JSON.stringify(e)); }
+  };
+  OneDrive.open(odOptions);
+};
+
+// 3) アップロード
+document.getElementById("upload").onclick = async () => {
+  if (!TICKET) { alert("ticket がありません"); return; }
+  if (!pickedFolderId) { alert("先にフォルダを選んでください"); return; }
+
+  // eml の場合は拡張子を強制的に整える（うっかり.txtでも修正）
+  let nm = (document.getElementById("name").value || SUGGEST).trim();
+  if (payloadType === "eml" && nm && !nm.toLowerCase().endsWith(".eml")) {
+    nm = nm + ".eml";
+    document.getElementById("name").value = nm;
+  }
+
+  const fd = new FormData();
+  fd.append("ticket", TICKET);
+  fd.append("folderId", pickedFolderId);
+  if (nm) fd.append("fileName", nm);
+
+  try {
+    log("→ アップロード開始");
+    document.getElementById("upload").disabled = true;
+    const r = await fetch(RENDER_UPLOAD_ENDPOINT, { method:"POST", body: fd });
+    const j = await r.json().catch(()=> ({}));
+    document.getElementById("upload").disabled = false;
+    if (r.ok) {
+      log("✅ 完了: " + (j.webUrl || "(URLなし)"));
+      if (j.webUrl) {
+        const a = document.createElement("a");
+        a.href = j.webUrl; a.textContent = "OneDriveで開く";
+        a.target = "_blank";
+        document.getElementById("log").appendChild(a);
+        document.getElementById("log").appendChild(document.createTextNode("\n"));
+      }
+    } else {
+      log("❌ 失敗: " + (j.error || r.statusText) + "\n" + (j.detail || ""));
+    }
+  } catch (e) {
+    log("❌ 例外: " + e.message);
+    document.getElementById("upload").disabled = false;
+  }
+};
+</script>
