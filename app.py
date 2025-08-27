@@ -819,7 +819,7 @@
 #＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 
 import os, time, json, base64, secrets, requests, html as _html
-from flask import Flask, request, jsonify, redirect, make_response
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from email.message import EmailMessage
 from email.utils import formatdate
@@ -921,11 +921,9 @@ def health():
 def _text_to_html(s: str) -> str:
     if not s:
         return "<p></p>"
-    # 正規化してHTMLエスケープ
     t = (_html.escape(s or "")
          .replace("\r\n", "\n")
          .replace("\r", "\n"))
-    # 段落は空行で区切り、改行は <br> に
     paras = t.split("\n\n")
     html_body = "".join(f"<p>{p.replace('\n','<br>')}</p>" for p in paras)
     return html_body or "<p></p>"
@@ -938,7 +936,7 @@ def build_eml_bytes(subject, from_addr, to_addrs, body_text="", body_html=None, 
     msg["To"] = ", ".join(to_addrs) if isinstance(to_addrs, list) else (to_addrs or "")
     msg["Date"] = date_str or formatdate(localtime=True)
 
-    # 常に text/plain は入れる
+    # text/plain は常に入れる
     msg.set_content(body_text or "", subtype="plain", charset="utf-8")
 
     # HTML が無ければ text から自動生成
@@ -1058,7 +1056,7 @@ def materialize_bytes(meta: dict) -> bytes:
     if t == "eml":
         # text が本文の正。html が無い or htmlFromText==true なら text から自動生成
         body_text = p.get("text", "") or ""
-        html_from_text = bool(p.get("htmlFromText"))  # 任意フラグ
+        html_from_text = bool(p.get("htmlFromText"))
         body_html = p.get("html")
         if html_from_text or body_html in (None, False, ""):
             body_html = _text_to_html(body_text)
@@ -1110,6 +1108,26 @@ def graph_put_chunked_to_folder(folder_id: str, name: str, data: bytes):
         pos += len(chunk)
     return last
 
+# ===== OneDriveアイテム詳細（name/webUrl を取得） =====
+@app.get("/api/drive/item")
+def api_drive_item():
+    """
+    ?id=<item_id> を受け、OneDriveの name / webUrl を返す
+    """
+    try:
+        item_id = request.args.get("id")
+        if not item_id:
+            return jsonify({"error": "missing id"}), 400
+        refresh_if_needed()
+        url = f"{GRAPH}/me/drive/items/{quote(item_id, safe='')}"
+        r = requests.get(url, headers={"Authorization": f"Bearer {TOKENS['access_token']}"}, timeout=20)
+        if not r.ok:
+            return jsonify({"error": "graph", "status": r.status_code, "detail": r.text}), r.status_code
+        j = r.json()
+        return jsonify({"name": j.get("name"), "webUrl": j.get("webUrl")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
 # ===== アップロードAPI =====
 @app.post("/api/upload")
 def api_upload():
@@ -1142,4 +1160,5 @@ def api_upload():
             return jsonify({"error": "graph upload failed", "status": r.status_code, "detail": r.text}), r.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
 
