@@ -38,19 +38,19 @@ const TICKET  = q.get("ticket") || "";
 const SUGGEST = q.get("suggest") || "download.txt";
 document.getElementById("name").value = SUGGEST;
 
-// ★本番値（RenderのFlask URL と OneDrive PickerのアプリID）
-const RENDER_BASE = "https://ai-az.onrender.com";                 // ← 指定どおり固定
-const FRONT_CLIENT_ID = "YOUR_ONEDRIVE_PICKER_APP_ID";            // ← あなたのアプリIDに置換
+// ★本番値
+const RENDER_BASE = "https://ai-az.onrender.com";
+const FRONT_CLIENT_ID = "4be5eab6-df8a-4990-b738-be8b2b0ba842";  // ← 置換済み
 const RENDER_UPLOAD_ENDPOINT = RENDER_BASE + "/api/upload";
 const RENDER_PEEK_ENDPOINT   = RENDER_BASE + "/tickets/peek";
 
 let pickedFolderId = null;
-let payloadType = "text"; // peekで上書き予定
+let payloadType = "text";
 
 const log  = (m)=> document.getElementById("log").textContent += m + "\n";
 const hint = (m)=> document.getElementById("pickedHint").textContent = m;
 
-// 1) 初期表示時に /tickets/peek でサーバ側ファイル名を参照し、入力欄に反映
+// 1) 初期名を /tickets/peek から取得
 (async function initNameFromPeek(){
   if (!TICKET) { log("⚠ ticket がクエリになく初期名は suggest のままです"); return; }
   try {
@@ -61,13 +61,9 @@ const hint = (m)=> document.getElementById("pickedHint").textContent = m;
 
     const current = document.getElementById("name").value.trim();
     const isDefaultSuggest = (SUGGEST === "download.txt" || current === "" || current === SUGGEST);
-
-    // デフォルト suggest なら、peek の fileName を優先
     if (isDefaultSuggest && j.fileName) {
       document.getElementById("name").value = j.fileName;
     }
-
-    // eml の場合は念のため拡張子を整える
     if (payloadType === "eml") {
       const nm = document.getElementById("name").value.trim() || "message.eml";
       document.getElementById("name").value = nm.toLowerCase().endsWith(".eml") ? nm : (nm + ".eml");
@@ -82,27 +78,25 @@ document.getElementById("pick").onclick = () => {
   if (!FRONT_CLIENT_ID) { alert("FRONT_CLIENT_ID が未設定です"); return; }
   const odOptions = {
     clientId: FRONT_CLIENT_ID,
-    action: "query",           // メタデータ（ID）取得
-    viewType: "folders",       // フォルダのみ
+    action: "query",
+    viewType: "folders",
     multiSelect: false,
     openInNewWindow: true,
     advanced: {
       endpointHint: "api.onedrive.com",
-      // redirectUri: location.origin + "/picker-redirect.html" // 必要時に設定
+      redirectUri: location.origin + "/picker-redirect.html"
     },
     success: async function(res) {
       const it = (res.value && res.value[0]) || null;
       if (!it || !it.id || !it.folder) { log("❌ フォルダが選択されませんでした"); return; }
-      pickedFolderId = it.id; // /me/drive/items/{id} の {id}
+      pickedFolderId = it.id;
 
-      // Graph API で name/webUrl を引く（必ずフォルダ名を表示したい）
       let label = "";
       try {
         const r = await fetch(RENDER_BASE + "/api/drive/item?id=" + encodeURIComponent(it.id));
         const meta = await r.json();
         if (r.ok && meta.name) {
           label = meta.name;
-          // 任意：ログに開くリンク
           if (meta.webUrl) {
             const a = document.createElement("a");
             a.href = meta.webUrl; a.textContent = "選択フォルダをOneDriveで開く"; a.target = "_blank";
@@ -131,7 +125,6 @@ document.getElementById("upload").onclick = async () => {
   if (!TICKET) { alert("ticket がありません"); return; }
   if (!pickedFolderId) { alert("先にフォルダを選んでください"); return; }
 
-  // eml の場合は拡張子を強制的に整える（うっかり.txtでも修正）
   let nm = (document.getElementById("name").value || SUGGEST).trim();
   if (payloadType === "eml" && nm && !nm.toLowerCase().endsWith(".eml")) {
     nm = nm + ".eml";
