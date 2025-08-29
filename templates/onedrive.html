@@ -8,14 +8,30 @@
   input[type=text]{ flex:1; padding:8px; }
   button { padding:10px 12px; border:1px solid #ccc; border-radius:10px; cursor:pointer; }
   #log { white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:12px; min-height:80px;}
+  .muted { color:#666 }
 </style>
 
 <h1>OneDrive（個人）に保存</h1>
-<p>1) 保存先フォルダを選んで → 2) アップロード を押してください。</p>
+<p>1) 保存先フォルダを選んで → 2) 保存したい項目をチェック → 3) アップロード</p>
 
+<!-- ファイル名共通上書き（未入力なら各ticketのデフォルト名を使用） -->
 <div class="row">
-  <label>ファイル名</label>
+  <label>ファイル名（任意）</label>
   <input id="name" type="text" placeholder="Report.txt">
+</div>
+
+<!-- 3つの保存対象をチェックボックスで選択 -->
+<div class="row">
+  <label><input type="checkbox" id="cb_eml"> 1) LLM出力（.eml）</label>
+  <span id="nm_eml" class="muted"></span>
+</div>
+<div class="row">
+  <label><input type="checkbox" id="cb_xlsx"> 2) 添付エクセル（.msg内のExcel）</label>
+  <span id="nm_xlsx" class="muted"></span>
+</div>
+<div class="row">
+  <label><input type="checkbox" id="cb_msg"> 3) .msg 原文（Excel添付入り）</label>
+  <span id="nm_msg" class="muted"></span>
 </div>
 
 <div class="row">
@@ -34,46 +50,72 @@
 <script src="https://js.live.net/v7.2/OneDrive.js"></script>
 <script>
 const q = new URLSearchParams(location.search);
-const TICKET  = q.get("ticket") || "";
+
+// 受け取るチケット（複数）
+const T_EML  = q.get("ticket_eml")  || "";
+const T_MSG  = q.get("ticket_msg")  || "";
+// （必要なら）Excel単独ticketも受け取れるように：const T_XLSX = q.get("ticket_xlsx") || "";
+
 const SUGGEST = q.get("suggest") || "download.txt";
 document.getElementById("name").value = SUGGEST;
 
-// ★本番値
+// ★本番値（必要に応じて置換）
 const RENDER_BASE = "https://ai-az.onrender.com";
-const FRONT_CLIENT_ID = "4be5eab6-df8a-4990-b738-be8b2b0ba842";  // ← 置換済み
-const RENDER_UPLOAD_ENDPOINT = RENDER_BASE + "/api/upload";
-const RENDER_PEEK_ENDPOINT   = RENDER_BASE + "/tickets/peek";
+const FRONT_CLIENT_ID = "4be5eab6-df8a-4990-b738-be8b2b0ba842";
+const RENDER_UPLOAD_ENDPOINT      = RENDER_BASE + "/api/upload";           // 原文/汎用
+const RENDER_PEEK_ENDPOINT        = RENDER_BASE + "/tickets/peek";         // 事前表示
+const RENDER_UPLOAD_MSG_XLSX_EP   = RENDER_BASE + "/api/upload-msg-xlsx";  // 新規：.msg→xlsx 保存
 
 let pickedFolderId = null;
-let payloadType = "text";
+// 参考用：単体モード互換
+const TICKET_SINGLE = q.get("ticket") || "";
 
+// ログ & ヒント
 const log  = (m)=> document.getElementById("log").textContent += m + "\n";
 const hint = (m)=> document.getElementById("pickedHint").textContent = m;
 
-// 1) 初期名を /tickets/peek から取得
-(async function initNameFromPeek(){
-  if (!TICKET) { log("⚠ ticket がクエリになく初期名は suggest のままです"); return; }
-  try {
-    const r = await fetch(RENDER_PEEK_ENDPOINT + "?ticket=" + encodeURIComponent(TICKET));
-    const j = await r.json();
-    if (!r.ok) { log("peek失敗: " + (j.error || r.statusText)); return; }
-    payloadType = (j.type || "text").toLowerCase();
+// チケットの中身を peek して UI に反映
+async function peekTicket(ticket) {
+  if (!ticket) return null;
+  const r = await fetch(RENDER_PEEK_ENDPOINT + "?ticket=" + encodeURIComponent(ticket));
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return { fileName: j.fileName || "", type: (j.type || "text").toLowerCase() };
+}
 
-    const current = document.getElementById("name").value.trim();
-    const isDefaultSuggest = (SUGGEST === "download.txt" || current === "" || current === SUGGEST);
-    if (isDefaultSuggest && j.fileName) {
-      document.getElementById("name").value = j.fileName;
+(async function initPeek(){
+  try {
+    if (T_EML) {
+      const pe = await peekTicket(T_EML);
+      document.getElementById("nm_eml").textContent = `→ ${pe.fileName || "(名前未設定)"} [${pe.type}]`;
+      // 便利のため、emlのみ拡張子補正
+      if (pe.type === "eml") {
+        const current = document.getElementById("name").value.trim();
+        const isDefaultSuggest = (SUGGEST === "download.txt" || current === "" || current === SUGGEST);
+        if (isDefaultSuggest && pe.fileName) document.getElementById("name").value = pe.fileName;
+        const nm = document.getElementById("name").value.trim() || "message.eml";
+        document.getElementById("name").value = nm.toLowerCase().endsWith(".eml") ? nm : (nm + ".eml");
+      }
     }
-    if (payloadType === "eml") {
-      const nm = document.getElementById("name").value.trim() || "message.eml";
-      document.getElementById("name").value = nm.toLowerCase().endsWith(".eml") ? nm : (nm + ".eml");
+    if (T_MSG) {
+      const pm = await peekTicket(T_MSG);
+      document.getElementById("nm_msg").textContent = `→ ${pm.fileName || "(名前未設定)"} [${pm.type}]`;
+      // 添付Excel名は .msg を開くまで確定しないのでここはプレースホルダ表示
+      document.getElementById("nm_xlsx").textContent = "→ （.msg内の最初のExcelを保存）";
     }
-  } catch (e) {
+
+    // 単体互換（?ticket=... のみ渡された場合は 1) に割当）
+    if (!T_EML && !T_MSG && TICKET_SINGLE) {
+      const p1 = await peekTicket(TICKET_SINGLE);
+      document.getElementById("nm_eml").textContent = `→ ${p1.fileName || "(名前未設定)"} [${p1.type}]`;
+      document.getElementById("cb_eml").checked = true;
+    }
+  } catch(e) {
     log("peek例外: " + e.message);
   }
 })();
 
-// 2) フォルダ選択
+// フォルダ選択（既存の動線のまま）
 document.getElementById("pick").onclick = () => {
   if (!FRONT_CLIENT_ID) { alert("FRONT_CLIENT_ID が未設定です"); return; }
   const odOptions = {
@@ -120,42 +162,95 @@ document.getElementById("pick").onclick = () => {
   OneDrive.open(odOptions);
 };
 
-// 3) アップロード
+// 共通POST
+async function uploadOne(endpoint, ticket, nameOverride) {
+  const fd = new FormData();
+  fd.append("ticket", ticket);
+  fd.append("folderId", pickedFolderId);
+  if (nameOverride) fd.append("fileName", nameOverride);
+  const r = await fetch(endpoint, { method: "POST", body: fd });
+  const j = await r.json().catch(()=> ({}));
+  return { ok: r.ok, status: r.status, body: j };
+}
+
+// アップロード実行
 document.getElementById("upload").onclick = async () => {
-  if (!TICKET) { alert("ticket がありません"); return; }
   if (!pickedFolderId) { alert("先にフォルダを選んでください"); return; }
 
+  // 送る対象を収集
+  const want_eml  = document.getElementById("cb_eml").checked && (T_EML || TICKET_SINGLE);
+  const want_xlsx = document.getElementById("cb_xlsx").checked && T_MSG;  // .msg 内の Excel を新APIへ
+  const want_msg  = document.getElementById("cb_msg").checked && T_MSG;   // .msg 原文は従来APIへ
+
+  if (!want_eml && !want_xlsx && !want_msg) {
+    alert("保存する項目にチェックを入れてください");
+    return;
+  }
+
   let nm = (document.getElementById("name").value || SUGGEST).trim();
-  if (payloadType === "eml" && nm && !nm.toLowerCase().endsWith(".eml")) {
+  // eml の時だけ拡張子補正（任意）
+  if (want_eml && nm && !nm.toLowerCase().endsWith(".eml")) {
     nm = nm + ".eml";
     document.getElementById("name").value = nm;
   }
 
-  const fd = new FormData();
-  fd.append("ticket", TICKET);
-  fd.append("folderId", pickedFolderId);
-  if (nm) fd.append("fileName", nm);
-
+  document.getElementById("upload").disabled = true;
   try {
-    log("→ アップロード開始");
-    document.getElementById("upload").disabled = true;
-    const r = await fetch(RENDER_UPLOAD_ENDPOINT, { method:"POST", body: fd });
-    const j = await r.json().catch(()=> ({}));
-    document.getElementById("upload").disabled = false;
-    if (r.ok) {
-      log("✅ 完了: " + (j.webUrl || "(URLなし)"));
-      if (j.webUrl) {
-        const a = document.createElement("a");
-        a.href = j.webUrl; a.textContent = "OneDriveで開く";
-        a.target = "_blank";
-        document.getElementById("log").appendChild(a);
-        document.getElementById("log").appendChild(document.createTextNode("\n"));
+    // 1) .eml（単体互換を優先）
+    if (want_eml) {
+      const ticket = T_EML || TICKET_SINGLE;
+      log(`→ アップロード開始: .eml`);
+      const r = await uploadOne(RENDER_UPLOAD_ENDPOINT, ticket, nm || undefined);
+      if (r.ok) {
+        log(`✅ 完了(.eml): ${r.body.webUrl || ""}`);
+        if (r.body.webUrl) {
+          const a = document.createElement("a");
+          a.href = r.body.webUrl; a.textContent = r.body.name || "OneDriveで開く"; a.target = "_blank";
+          document.getElementById("log").appendChild(a);
+          document.getElementById("log").appendChild(document.createTextNode("\n"));
+        }
+      } else {
+        log(`❌ 失敗(.eml): ${r.status} ${JSON.stringify(r.body)}`);
       }
-    } else {
-      log("❌ 失敗: " + (j.error || r.statusText) + "\n" + (j.detail || ""));
     }
-  } catch (e) {
+
+    // 2) 添付Excel（.msg → Excel抽出API）
+    if (want_xlsx) {
+      log(`→ アップロード開始: .msg内Excel`);
+      const r = await uploadOne(RENDER_UPLOAD_MSG_XLSX_EP, T_MSG, undefined /* nameは添付名を優先 */);
+      if (r.ok) {
+        log(`✅ 完了(Excel): ${r.body.webUrl || ""}`);
+        if (r.body.webUrl) {
+          const a = document.createElement("a");
+          a.href = r.body.webUrl; a.textContent = r.body.name || "OneDriveで開く"; a.target = "_blank";
+          document.getElementById("log").appendChild(a);
+          document.getElementById("log").appendChild(document.createTextNode("\n"));
+        }
+      } else {
+        log(`❌ 失敗(Excel): ${r.status} ${JSON.stringify(r.body)}`);
+      }
+    }
+
+    // 3) .msg 原文（従来API）
+    if (want_msg) {
+      log(`→ アップロード開始: .msg 原文`);
+      const r = await uploadOne(RENDER_UPLOAD_ENDPOINT, T_MSG, undefined /* name上書きしたいならここで渡す */);
+      if (r.ok) {
+        log(`✅ 完了(.msg): ${r.body.webUrl || ""}`);
+        if (r.body.webUrl) {
+          const a = document.createElement("a");
+          a.href = r.body.webUrl; a.textContent = r.body.name || "OneDriveで開く"; a.target = "_blank";
+          document.getElementById("log").appendChild(a);
+          document.getElementById("log").appendChild(document.createTextNode("\n"));
+        }
+      } else {
+        log(`❌ 失敗(.msg): ${r.status} ${JSON.stringify(r.body)}`);
+      }
+    }
+
+  } catch(e) {
     log("❌ 例外: " + e.message);
+  } finally {
     document.getElementById("upload").disabled = false;
   }
 };
