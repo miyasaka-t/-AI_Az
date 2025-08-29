@@ -645,7 +645,8 @@ def _extract_first_excel_from_msg(msg_bytes: bytes):
 # ===============================
 @app.get("/")
 def index():
-    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29-batch"})
+    # バージョンで新コード稼働確認
+    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29-batch-multi-fixed"})
 
 @app.get("/front")
 def serve_front():
@@ -710,20 +711,24 @@ def tickets_create_multipart():
                      mime:     明示したい場合に指定
                      ttlSec:   TTL 秒
                      xlsxFileName: 抽出Excelの保存名（任意）
-    戻り:
-      - 1つだけ作成 → {"ticket":"..."}  （後方互換）
-      - 複数作成     → {
-            "ok": true,
-            "tickets": {
-               "file": "<msg等の原文ticket> or null",
-               "metadata": "<metadata由来のticket> or null",
-               "xlsxFromMsg": "<.msg内Excelのticket> or null"
-            }
-         }
+    戻り: 常にまとめ形式
+      {
+        "ok": true,
+        "tickets": {
+          "file": "<msg等の原文ticket> or null",
+          "metadata": "<metadata由来のticket> or null",
+          "xlsxFromMsg": "<.msg内Excelのticket> or null"
+        }
+      }
     """
     try:
         meta_text = request.form.get("metadata", "") or ""
         meta_json = json.loads(meta_text) if meta_text.strip() else {}
+
+        # 簡易ログ（Renderのログで確認用）
+        print("[create-multipart] has_file=", bool(request.files.get("file")))
+        print("[create-multipart] meta_json_keys=", list(meta_json.keys()) if meta_json else [])
+        print("[create-multipart] extractXlsx=", meta_json.get("extractXlsx") if meta_json else None)
 
         ttl = int(meta_json.get("ttlSec") or DEFAULT_TICKET_TTL)
 
@@ -784,11 +789,7 @@ def tickets_create_multipart():
                     "data": base64.b64encode(att_bytes).decode("ascii")
                 }, ttl=ttl)
 
-        # 後方互換：作成数が1つだけなら {"ticket": "..."} を返す
-        created = [t for t in [made_file_ticket, made_meta_ticket, made_xlsx_ticket] if t]
-        if len(created) == 1:
-            return jsonify({"ticket": created[0]})
-
+        # 常にまとめ形式で返す
         return jsonify({
             "ok": True,
             "tickets": {
@@ -993,6 +994,8 @@ def api_upload_msg_xlsx():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
+
 
 
 
