@@ -351,7 +351,7 @@
 
 # ============================================
 
-# app.py — personal(org)両対応・/api/msg-to-xlsx-ticket追加版
+# app.py — personal(org)両対応・/api/msg-to-xlsx-ticket(強化)版
 import os, io, re, json, time, base64, mimetypes, tempfile
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
@@ -368,13 +368,13 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 # ===============================
 # 環境変数（組織 / アプリ権限）
 # ===============================
-TENANT_ID      = os.getenv("AZ_TENANT_ID", "")
-CLIENT_ID_ORG  = os.getenv("AZ_CLIENT_ID", "")
+TENANT_ID         = os.getenv("AZ_TENANT_ID", "")
+CLIENT_ID_ORG     = os.getenv("AZ_CLIENT_ID", "")
 CLIENT_SECRET_ORG = os.getenv("AZ_CLIENT_SECRET", "")
-TARGET_USER_ID = os.getenv("TARGET_USER_ID", "")  # /users/{id} の id
+TARGET_USER_ID    = os.getenv("TARGET_USER_ID", "")  # /users/{id} の id
 
-GRAPH_BASE   = "https://graph.microsoft.com/v1.0"
-GRAPH_SCOPE  = "https://graph.microsoft.com/.default"
+GRAPH_BASE  = "https://graph.microsoft.com/v1.0"
+GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
 SMALL_MAX_BYTES = 250 * 1024 * 1024  # 250MB
 CHUNK_SIZE      = 5 * 1024 * 1024    # 5MB
@@ -518,8 +518,8 @@ def redeem_ticket(tid: str, consume: bool = True) -> Dict[str, Any]:
 # 共通ユーティリティ
 # ===============================
 def _sanitize_name(name: str) -> str:
-    safe = (name or "upload.bin").replace("/", "_").replace("\\", "_").strip()
-    return safe or "upload.bin"
+    safe = (name or "download.bin").replace("/", "_").replace("\\", "_").strip()
+    return safe or "download.bin"
 
 def _to_str(v: Any) -> str:
     if v is None:
@@ -529,15 +529,18 @@ def _to_str(v: Any) -> str:
 
 def _build_eml(metadata: Dict[str, Any]) -> Tuple[str, bytes, str]:
     """
-    payload 例:
+    metadata例:
       {
         "type": "eml",
-        "subject": "...",
-        "from": "noreply@example.com",
-        "to": ["a@b"],
-        "text": "本文",
-        "htmlFromText": true,
-        "date": "Wed, 27 Aug 2025 09:30:00 +0900"
+        "fileName": "message.eml",
+        "payload": {
+          "subject": "...",
+          "from": "noreply@example.com",
+          "to": ["a@b"],
+          "text": "本文",
+          "htmlFromText": true,
+          "date": "Wed, 27 Aug 2025 09:30:00 +0900"
+        }
       }
     """
     payload = metadata.get("payload", {}) or {}
@@ -724,7 +727,7 @@ def graph_put_chunked_to_folder_personal(folder_id: str, name: str, data: bytes)
 # ===============================
 @app.get("/")
 def index():
-    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29-personal-org-unified+msg2xlsx"})
+    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29-personal-org-unified+msg2xlsx-robust"})
 
 @app.get("/front")
 def serve_front():
@@ -732,10 +735,11 @@ def serve_front():
 
 @app.get("/picker-redirect.html")
 def picker_redirect():
+    # Pickerのredirect先。中身は何でも可
     return "<!doctype html><meta charset='utf-8'><title>close</title>OK"
 
 # ===============================
-# API：チケット作成 / 参照 / ダウンロード（個人save用）
+# API：チケット作成 / 参照 / ダウンロード
 # ===============================
 @app.post("/tickets/create")
 def tickets_create():
@@ -933,31 +937,78 @@ def _extract_first_excel_from_msg(msg_bytes: bytes):
     return None
 
 # ===============================
-# 互換API: .msg → xlsx チケット作成（既存呼び先の404対策）
+# 互換API: .msg → xlsx チケット作成（多形式入力に対応）
 # ===============================
 @app.post("/api/msg-to-xlsx-ticket")
 def api_msg_to_xlsx_ticket():
     """
-    form-data:
-      ticket : .msg を指すチケットID（非消費）
+    入力（どれでもOK）:
+      - form-data: ticket=<.msgのチケット> / msg_ticket=<...> / fileName=...
+      - JSON: {"ticket":"..." , "fileName":"..."}
+      - JSON: {"ok":true,"tickets":{"file":"<MSG_TICKET>", ...}}
+      - JSON: {"arg1":"{\"ticket\":\"...\",\"fileName\":\"...\"}\n"}  # 文字列の中にJSON
+      - query: ?ticket=... / ?msg_ticket=...
+      - 任意: ttlSec (チケットTTL上書き)
     戻り:
       200: {"ok": true, "ticket": "<xlsx_ticket>", "fileName": "..."}
+      400/404: {"error": "..."}
     """
     try:
-        msg_tid = request.form.get("ticket")
-        if not msg_tid:
-            return jsonify({"error": "missing ticket"}), 400
+        # 1) form / query
+        msg_tid = (
+            request.form.get("ticket")
+            or request.form.get("msg_ticket")
+            or request.args.get("ticket")
+            or request.args.get("msg_ticket")
+        )
+        name_ovr = request.form.get("fileName")
+        ttl_override = request.form.get("ttlSec")
 
-        # .msg 実体（非消費）
+        # 2) JSON本体
+        j = request.get_json(silent=True) or {}
+        if not msg_tid:
+            # 直置き
+            msg_tid = j.get("ticket") or j.get("msg_ticket")
+            # tickets構造（前段レスポンスをそのまま投げるケース）
+            if not msg_tid and isinstance(j.get("tickets"), dict):
+                msg_tid = j["tickets"].get("file") or j["tickets"].get("msg") or j["tickets"].get("ticket_msg")
+            # arg1にJSON文字列
+            if not msg_tid and isinstance(j.get("arg1"), str):
+                try:
+                    j2 = json.loads(j["arg1"].strip())
+                    msg_tid = j2.get("ticket") or j2.get("msg_ticket")
+                    if not msg_tid and isinstance(j2.get("tickets"), dict):
+                        msg_tid = j2["tickets"].get("file") or j2["tickets"].get("msg") or j2["tickets"].get("ticket_msg")
+                    if not name_ovr:
+                        name_ovr = j2.get("fileName")
+                    if not ttl_override:
+                        ttl_override = j2.get("ttlSec")
+                except Exception:
+                    pass
+        if not name_ovr:
+            name_ovr = j.get("fileName")
+        if not ttl_override:
+            ttl_override = j.get("ttlSec")
+
+        if not msg_tid:
+            return jsonify({"error": "missing ticket (accepts form 'ticket', JSON 'ticket', 'tickets.file', 'arg1', or query '?ticket=...' )"}), 400
+
+        try:
+            x_ttl = int(ttl_override) if ttl_override not in (None, "") else DEFAULT_TICKET_TTL
+        except Exception:
+            x_ttl = DEFAULT_TICKET_TTL
+
+        # .msg 実体（非消費：何度でも使えるように）
         meta = redeem_ticket(msg_tid, consume=False)
         _, msg_bytes, _ = materialize_bytes(meta)
 
+        # .msg → 最初のExcel
         hit = _extract_first_excel_from_msg(msg_bytes)
         if not hit:
             return jsonify({"error": "no_excel_attachment_found"}), 400
 
         att_name, att_bytes, att_mime = hit
-        save_name = (att_name or "attachment.xlsx").strip()
+        save_name = (name_ovr or att_name or "attachment.xlsx").strip()
         if not save_name.lower().endswith((".xlsx", ".xlsm", ".xls", ".csv")):
             save_name += ".xlsx"
 
@@ -966,9 +1017,10 @@ def api_msg_to_xlsx_ticket():
             "fileName": save_name,
             "mime": att_mime or "application/octet-stream",
             "data": base64.b64encode(att_bytes).decode("ascii")
-        }, ttl=DEFAULT_TICKET_TTL)
+        }, ttl=x_ttl)
 
         return jsonify({"ok": True, "ticket": x_tid, "fileName": save_name})
+
     except KeyError:
         return jsonify({"error": "ticket_not_found_or_expired"}), 404
     except Exception as e:
