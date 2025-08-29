@@ -1,26 +1,30 @@
 <!doctype html>
 <meta charset="utf-8" />
-<title>OneDrive（個人）に保存</title>
+<title>OneDrive 保存（個人/組織 両対応）</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-  body { font:14px/1.6 system-ui; max-width:780px; margin:24px auto; }
+  body { font:14px/1.6 system-ui; max-width:820px; margin:24px auto; }
   .row { display:flex; gap:8px; margin:10px 0; align-items:center; flex-wrap:wrap; }
   input[type=text]{ flex:1; padding:8px; }
   button { padding:10px 12px; border:1px solid #ccc; border-radius:10px; cursor:pointer; }
-  #log { white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:12px; min-height:80px;}
+  #log { white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:12px; min-height:120px;}
   .muted { color:#666 }
+  .badge { padding:2px 8px; border-radius:999px; background:#eef; color:#224; font-weight:600; }
+  .hide { display:none; }
 </style>
 
-<h1>OneDrive（個人）に保存</h1>
-<p>1) 保存先フォルダを選んで → 2) 保存したい項目をチェック → 3) アップロード</p>
+<h1>OneDrive 保存 <span id="modeBadge" class="badge"></span></h1>
+<p>
+  URL のクエリで <code>?mode=personal</code>（個人・既定） または <code>?mode=org</code>（組織）を指定してね。
+</p>
 
-<!-- ファイル名共通上書き（未入力なら各ticketのデフォルト名を使用） -->
+<!-- 共通：ファイル名上書き -->
 <div class="row">
   <label>ファイル名（任意）</label>
   <input id="name" type="text" placeholder="Report.txt">
 </div>
 
-<!-- 3つの保存対象をチェックボックスで選択 -->
+<!-- 共通：チケット状況 -->
 <div class="row">
   <label><input type="checkbox" id="cb_eml"> 1) LLM出力（.eml）</label>
   <span id="nm_eml" class="muted"></span>
@@ -34,13 +38,27 @@
   <span id="nm_msg" class="muted"></span>
 </div>
 
-<div class="row">
-  <button id="pick">📁 保存先フォルダを選ぶ</button>
-  <span id="pickedHint"></span>
+<!-- 個人用 UI -->
+<div id="personalPanel">
+  <div class="row">
+    <button id="savePersonal">💾 個人OneDriveに保存（Picker save）</button>
+    <span class="muted">※保存先は保存ダイアログで選択</span>
+  </div>
+  <div class="row">
+    <button id="savePersonalXlsx">💾 （個人）.msg内Excelを保存</button>
+    <span class="muted">.msgからExcelを抽出→新ticket→save</span>
+  </div>
 </div>
 
-<div class="row">
-  <button id="upload" disabled>⬆ アップロード</button>
+<!-- 組織用 UI -->
+<div id="orgPanel" class="hide">
+  <div class="row">
+    <button id="pick">📁 組織OneDriveの保存先フォルダを選ぶ</button>
+    <span id="pickedHint"></span>
+  </div>
+  <div class="row">
+    <button id="upload" disabled>⬆ （組織）アップロード実行</button>
+  </div>
 </div>
 
 <h3>ログ</h3>
@@ -51,30 +69,39 @@
 <script>
 const q = new URLSearchParams(location.search);
 
-// 受け取るチケット（複数）
+// モード（既定 personal）
+const MODE = (q.get("mode") || "personal").toLowerCase(); // "personal" | "org"
+document.getElementById("modeBadge").textContent = MODE === "org" ? "組織モード" : "個人モード";
+document.getElementById("personalPanel").classList.toggle("hide", MODE !== "personal");
+document.getElementById("orgPanel").classList.toggle("hide", MODE !== "org");
+
+// 受け取るチケット
 const T_EML  = q.get("ticket_eml")  || "";
 const T_MSG  = q.get("ticket_msg")  || "";
-// （必要なら）Excel単独ticketも受け取れるように：const T_XLSX = q.get("ticket_xlsx") || "";
-
+const TICKET_SINGLE = q.get("ticket") || ""; // 単体互換
 const SUGGEST = q.get("suggest") || "download.txt";
 document.getElementById("name").value = SUGGEST;
 
-// ★本番値（必要に応じて置換）
-const RENDER_BASE = "https://ai-az.onrender.com";
-const FRONT_CLIENT_ID = "4be5eab6-df8a-4990-b738-be8b2b0ba842";
-const RENDER_UPLOAD_ENDPOINT      = RENDER_BASE + "/api/upload";           // 原文/汎用
+// ベースURLは自身のオリジンを利用
+const RENDER_BASE = location.origin;
+
+// 既存バックのエンドポイント
+const RENDER_UPLOAD_ENDPOINT      = RENDER_BASE + "/api/upload";           // 組織用：汎用アップロード
 const RENDER_PEEK_ENDPOINT        = RENDER_BASE + "/tickets/peek";         // 事前表示
-const RENDER_UPLOAD_MSG_XLSX_EP   = RENDER_BASE + "/api/upload-msg-xlsx";  // 新規：.msg→xlsx 保存
+const RENDER_UPLOAD_MSG_XLSX_EP   = RENDER_BASE + "/api/upload-msg-xlsx";  // 組織用：.msg→xlsx
+const RENDER_DOWNLOAD_ENDPOINT    = RENDER_BASE + "/tickets/download";     // 個人用：sourceUri
+const RENDER_MSG_TO_XLSX_TICKET   = RENDER_BASE + "/api/msg-to-xlsx-ticket"; // 個人用：xlsx ticket 生成
+
+// OneDrive Picker クライアントID（アプリ登録に合わせて設定）
+const FRONT_CLIENT_ID = "4be5eab6-df8a-4990-b738-be8b2b0ba842";
 
 let pickedFolderId = null;
-// 参考用：単体モード互換
-const TICKET_SINGLE = q.get("ticket") || "";
 
 // ログ & ヒント
 const log  = (m)=> document.getElementById("log").textContent += m + "\n";
 const hint = (m)=> document.getElementById("pickedHint").textContent = m;
 
-// チケットの中身を peek して UI に反映
+// ========== 共通：peek ==========
 async function peekTicket(ticket) {
   if (!ticket) return null;
   const r = await fetch(RENDER_PEEK_ENDPOINT + "?ticket=" + encodeURIComponent(ticket));
@@ -88,7 +115,7 @@ async function peekTicket(ticket) {
     if (T_EML) {
       const pe = await peekTicket(T_EML);
       document.getElementById("nm_eml").textContent = `→ ${pe.fileName || "(名前未設定)"} [${pe.type}]`;
-      // 便利のため、emlのみ拡張子補正
+      // eml の時は拡張子補正
       if (pe.type === "eml") {
         const current = document.getElementById("name").value.trim();
         const isDefaultSuggest = (SUGGEST === "download.txt" || current === "" || current === SUGGEST);
@@ -100,11 +127,8 @@ async function peekTicket(ticket) {
     if (T_MSG) {
       const pm = await peekTicket(T_MSG);
       document.getElementById("nm_msg").textContent = `→ ${pm.fileName || "(名前未設定)"} [${pm.type}]`;
-      // 添付Excel名は .msg を開くまで確定しないのでここはプレースホルダ表示
       document.getElementById("nm_xlsx").textContent = "→ （.msg内の最初のExcelを保存）";
     }
-
-    // 単体互換（?ticket=... のみ渡された場合は 1) に割当）
     if (!T_EML && !T_MSG && TICKET_SINGLE) {
       const p1 = await peekTicket(TICKET_SINGLE);
       document.getElementById("nm_eml").textContent = `→ ${p1.fileName || "(名前未設定)"} [${p1.type}]`;
@@ -115,9 +139,68 @@ async function peekTicket(ticket) {
   }
 })();
 
-// フォルダ選択（既存の動線のまま）
+// ========== 個人：Picker save ==========
+function openPersonalSave(sourceUrl, fileName) {
+  if (!FRONT_CLIENT_ID) { alert("FRONT_CLIENT_ID 未設定"); return; }
+  const odOptions = {
+    clientId: FRONT_CLIENT_ID,
+    action: "save",
+    openInNewWindow: true,
+    fileName: fileName,
+    sourceUri: sourceUrl,
+    advanced: {
+      endpointHint: "api.onedrive.com",
+      redirectUri: location.origin + "/picker-redirect.html"
+    },
+    success: function(res) { log("✅ 保存成功(個人): " + JSON.stringify(res)); },
+    cancel: function(){ log("キャンセル(個人)"); },
+    error: function(e){ log("❌ エラー(個人): " + JSON.stringify(e)); }
+  };
+  OneDrive.open(odOptions);
+}
+
+document.getElementById("savePersonal").onclick = async () => {
+  if (MODE !== "personal") { alert("今は組織モードです"); return; }
+  // 優先：eml → 単体 → msg 原文
+  const ticket = T_EML || TICKET_SINGLE || T_MSG;
+  if (!ticket) { alert("URLに ticket がありません"); return; }
+  let nm = (document.getElementById("name").value || SUGGEST || "download.bin").trim();
+  if (nm && (document.getElementById("cb_eml").checked || T_EML || TICKET_SINGLE)) {
+    // eml 保存意図なら拡張子補正
+    if (!nm.toLowerCase().endsWith(".eml")) nm = nm + ".eml";
+  }
+  const src = RENDER_DOWNLOAD_ENDPOINT + "?ticket=" + encodeURIComponent(ticket);
+  log("→ 個人 save 開始: " + nm);
+  openPersonalSave(src, nm);
+};
+
+// 個人：.msg 内 Excel を抽出してから save
+document.getElementById("savePersonalXlsx").onclick = async () => {
+  if (MODE !== "personal") { alert("今は組織モードです"); return; }
+  if (!T_MSG) { alert(".msg の ticket がありません"); return; }
+  const nm = (document.getElementById("name").value || "attachment.xlsx").trim();
+  try {
+    log("→ 個人: .msg→xlsx ticket 生成");
+    const r = await fetch(RENDER_MSG_TO_XLSX_TICKET, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ ticket: T_MSG, fileName: nm })
+    });
+    const j = await r.json();
+    if (!r.ok) { log("❌ 生成失敗: " + JSON.stringify(j)); return; }
+    const newTicket = j.ticket;
+    const src = RENDER_DOWNLOAD_ENDPOINT + "?ticket=" + encodeURIComponent(newTicket);
+    let saveName = nm;
+    if (!saveName.toLowerCase().match(/\.(xlsx|xlsm|xls|csv)$/)) saveName += ".xlsx";
+    openPersonalSave(src, saveName);
+  } catch(e) {
+    log("❌ 例外(個人xlsx): " + e.message);
+  }
+};
+
+// ========== 組織：Picker query → サーバーで Graph アップロード ==========
 document.getElementById("pick").onclick = () => {
-  if (!FRONT_CLIENT_ID) { alert("FRONT_CLIENT_ID が未設定です"); return; }
+  if (!FRONT_CLIENT_ID) { alert("FRONT_CLIENT_ID 未設定"); return; }
   const odOptions = {
     clientId: FRONT_CLIENT_ID,
     action: "query",
@@ -125,12 +208,12 @@ document.getElementById("pick").onclick = () => {
     multiSelect: false,
     openInNewWindow: true,
     advanced: {
-      endpointHint: "api.onedrive.com",
+      endpointHint: "graph.microsoft.com",
       redirectUri: location.origin + "/picker-redirect.html"
     },
     success: async function(res) {
       const it = (res.value && res.value[0]) || null;
-      if (!it || !it.id || !it.folder) { log("❌ フォルダが選択されませんでした"); return; }
+      if (!it || !it.id || !it.folder) { log("❌ フォルダ未選択"); return; }
       pickedFolderId = it.id;
 
       let label = "";
@@ -156,13 +239,12 @@ document.getElementById("pick").onclick = () => {
       log("Pick OK: folderId=" + pickedFolderId);
       document.getElementById("upload").disabled = false;
     },
-    cancel: function(){ log("キャンセルされました"); },
-    error: function(e){ log("エラー: " + JSON.stringify(e)); }
+    cancel: function(){ log("キャンセル(組織)"); },
+    error: function(e){ log("❌ エラー(組織): " + JSON.stringify(e)); }
   };
   OneDrive.open(odOptions);
 };
 
-// 共通POST
 async function uploadOne(endpoint, ticket, nameOverride) {
   const fd = new FormData();
   fd.append("ticket", ticket);
@@ -173,22 +255,19 @@ async function uploadOne(endpoint, ticket, nameOverride) {
   return { ok: r.ok, status: r.status, body: j };
 }
 
-// アップロード実行
 document.getElementById("upload").onclick = async () => {
+  if (MODE !== "org") { alert("今は個人モードです"); return; }
   if (!pickedFolderId) { alert("先にフォルダを選んでください"); return; }
 
-  // 送る対象を収集
   const want_eml  = document.getElementById("cb_eml").checked && (T_EML || TICKET_SINGLE);
-  const want_xlsx = document.getElementById("cb_xlsx").checked && T_MSG;  // .msg 内の Excel を新APIへ
-  const want_msg  = document.getElementById("cb_msg").checked && T_MSG;   // .msg 原文は従来APIへ
-
+  const want_xlsx = document.getElementById("cb_xlsx").checked && T_MSG;
+  const want_msg  = document.getElementById("cb_msg").checked && T_MSG;
   if (!want_eml && !want_xlsx && !want_msg) {
     alert("保存する項目にチェックを入れてください");
     return;
   }
 
   let nm = (document.getElementById("name").value || SUGGEST).trim();
-  // eml の時だけ拡張子補正（任意）
   if (want_eml && nm && !nm.toLowerCase().endsWith(".eml")) {
     nm = nm + ".eml";
     document.getElementById("name").value = nm;
@@ -196,10 +275,9 @@ document.getElementById("upload").onclick = async () => {
 
   document.getElementById("upload").disabled = true;
   try {
-    // 1) .eml（単体互換を優先）
     if (want_eml) {
       const ticket = T_EML || TICKET_SINGLE;
-      log(`→ アップロード開始: .eml`);
+      log("→ 組織: .eml アップロード開始");
       const r = await uploadOne(RENDER_UPLOAD_ENDPOINT, ticket, nm || undefined);
       if (r.ok) {
         log(`✅ 完了(.eml): ${r.body.webUrl || ""}`);
@@ -211,13 +289,13 @@ document.getElementById("upload").onclick = async () => {
         }
       } else {
         log(`❌ 失敗(.eml): ${r.status} ${JSON.stringify(r.body)}`);
+        if (r.body && r.body.detail) log("detail: " + r.body.detail);
       }
     }
 
-    // 2) 添付Excel（.msg → Excel抽出API）
     if (want_xlsx) {
-      log(`→ アップロード開始: .msg内Excel`);
-      const r = await uploadOne(RENDER_UPLOAD_MSG_XLSX_EP, T_MSG, undefined /* nameは添付名を優先 */);
+      log("→ 組織: .msg内Excel アップロード開始");
+      const r = await uploadOne(RENDER_UPLOAD_MSG_XLSX_EP, T_MSG, undefined);
       if (r.ok) {
         log(`✅ 完了(Excel): ${r.body.webUrl || ""}`);
         if (r.body.webUrl) {
@@ -228,13 +306,13 @@ document.getElementById("upload").onclick = async () => {
         }
       } else {
         log(`❌ 失敗(Excel): ${r.status} ${JSON.stringify(r.body)}`);
+        if (r.body && r.body.detail) log("detail: " + r.body.detail);
       }
     }
 
-    // 3) .msg 原文（従来API）
     if (want_msg) {
-      log(`→ アップロード開始: .msg 原文`);
-      const r = await uploadOne(RENDER_UPLOAD_ENDPOINT, T_MSG, undefined /* name上書きしたいならここで渡す */);
+      log("→ 組織: .msg 原文 アップロード開始");
+      const r = await uploadOne(RENDER_UPLOAD_ENDPOINT, T_MSG, undefined);
       if (r.ok) {
         log(`✅ 完了(.msg): ${r.body.webUrl || ""}`);
         if (r.body.webUrl) {
@@ -245,11 +323,11 @@ document.getElementById("upload").onclick = async () => {
         }
       } else {
         log(`❌ 失敗(.msg): ${r.status} ${JSON.stringify(r.body)}`);
+        if (r.body && r.body.detail) log("detail: " + r.body.detail);
       }
     }
-
   } catch(e) {
-    log("❌ 例外: " + e.message);
+    log("❌ 例外(組織): " + e.message);
   } finally {
     document.getElementById("upload").disabled = false;
   }

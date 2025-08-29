@@ -352,12 +352,15 @@
 # ============================================
 
 # app.py
-import os, io, re, json, time, base64, mimetypes, tempfile, math
+import os, io, re, json, time, base64, mimetypes, tempfile
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
 from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 import requests
+
+# （任意）個人/組織を跨ぐとき CORS を許可したい場合はコメントアウト解除
+# from flask_cors import CORS
 
 # ===============================
 # 設定（環境変数）
@@ -381,6 +384,7 @@ DEFAULT_TICKET_TTL = 600
 # Flask
 # ===============================
 app = Flask(__name__, static_folder="static", template_folder="templates")
+# CORS(app)
 
 # ===============================
 # 簡易チケットストア（メモリ）
@@ -418,8 +422,7 @@ def get_ticket(tid: str) -> Optional[Ticket]:
 
 def redeem_ticket(tid: str, consume: bool = True) -> Dict[str, Any]:
     """
-    チケットを取得（必要なら消費）。
-    見つからなければ 404 相当の例外を投げる。
+    チケットを取得（必要なら消費）。見つからなければ KeyError。
     """
     t = get_ticket(tid)
     if not t:
@@ -430,9 +433,11 @@ def redeem_ticket(tid: str, consume: bool = True) -> Dict[str, Any]:
     return meta
 
 # ===============================
-# Graph 認証＆ヘッダ
+# Graph 認証＆ヘッダ（組織用）
 # ===============================
 def get_app_token() -> str:
+    if not (TENANT_ID and CLIENT_ID and CLIENT_SECRET):
+        raise RuntimeError("Graph app-only requires AZ_TENANT_ID/CLIENT_ID/CLIENT_SECRET")
     url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
     data = {
         "client_id": CLIENT_ID,
@@ -451,7 +456,7 @@ def gheaders(token: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, st
     return h
 
 # ===============================
-# OneDrive ヘルパー（/users/{id}/drive を利用）
+# OneDrive（組織: /users/{id}/drive）
 # ===============================
 def _user_drive_root() -> str:
     if not TARGET_USER_ID:
@@ -465,15 +470,17 @@ def graph_get_item_meta(item_id: str) -> Dict[str, Any]:
     r.raise_for_status()
     return r.json()
 
+def _sanitize_name(name: str) -> str:
+    safe = (name or "upload.bin").replace("/", "_").replace("\\", "_").strip()
+    return safe or "upload.bin"
+
 def graph_put_small_to_folder(folder_id: str, name: str, mime: str, data: bytes) -> requests.Response:
     """
     親フォルダID配下に name をアップロード（<= SMALL_MAX_BYTES）
     PUT /users/{id}/drive/items/{parent-id}:/{name}:/content
     """
     token = get_app_token()
-    safe_name = name.strip()
-    if not safe_name:
-        safe_name = "upload.bin"
+    safe_name = _sanitize_name(name)
     url = f"{_user_drive_root()}/items/{folder_id}:/{safe_name}:/content"
     return requests.put(url, headers=gheaders(token, {"Content-Type": mime or "application/octet-stream"}),
                         data=data, timeout=300)
@@ -484,7 +491,7 @@ def graph_create_upload_session(folder_id: str, name: str) -> str:
     POST /users/{id}/drive/items/{parent-id}:/{name}:/createUploadSession
     """
     token = get_app_token()
-    safe_name = name.strip() or "upload.bin"
+    safe_name = _sanitize_name(name)
     url = f"{_user_drive_root()}/items/{folder_id}:/{safe_name}:/createUploadSession"
     r = requests.post(url, headers=gheaders(token, {"Content-Type": "application/json"}), json={}, timeout=60)
     r.raise_for_status()
@@ -502,9 +509,9 @@ def graph_put_chunked_to_folder(folder_id: str, name: str, data: bytes) -> reque
         headers = {
             "Content-Length": str(len(chunk)),
             "Content-Range": f"bytes {start}-{end}/{size}",
+            "Content-Type": "application/octet-stream",
         }
         r = requests.put(upload_url, headers=headers, data=chunk, timeout=600)
-        # 202 中間 / 200/201 完了
         if r.status_code not in (200, 201, 202):
             r.raise_for_status()
         off += len(chunk)
@@ -517,15 +524,12 @@ def _to_str(v: Any) -> str:
     if v is None:
         return ""
     s = str(v)
-    # 改行/タブ整形（必要に応じて）
     return s.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ").strip()
 
 def _build_eml(metadata: Dict[str, Any]) -> Tuple[str, bytes, str]:
     """
-    metadata例：
-    {
-      "fileName": "foo_made_by_AI",
-      "payload": {
+    payload 例:
+      {
         "type": "eml",
         "subject": "...",
         "from": "noreply@example.com",
@@ -534,11 +538,9 @@ def _build_eml(metadata: Dict[str, Any]) -> Tuple[str, bytes, str]:
         "htmlFromText": true,
         "date": "Wed, 27 Aug 2025 09:30:00 +0900"
       }
-    }
     """
     payload = metadata.get("payload", {}) or {}
     file_name = metadata.get("fileName") or "message"
-    # .eml 拡張子
     if not file_name.lower().endswith(".eml"):
         file_name += ".eml"
 
@@ -548,20 +550,15 @@ def _build_eml(metadata: Dict[str, Any]) -> Tuple[str, bytes, str]:
     if isinstance(tos, str):
         tos = [tos]
     date = _to_str(payload.get("date") or "")
-    text = payload.get("text")
+    text = payload.get("text") or ""
     html_from_text = bool(payload.get("htmlFromText"))
 
-    # 簡易RFC822（プレーン or HTML化）
-    if html_from_text and text is not None:
-        body = f"""Content-Type: text/html; charset="utf-8"
-
-<html><body><pre style="white-space:pre-wrap">{text}</pre></body></html>
-"""
+    if html_from_text:
+        body = f'<html><body><pre style="white-space:pre-wrap">{text}</pre></body></html>'
+        content_type = 'text/html; charset="utf-8"'
     else:
-        body = f"""Content-Type: text/plain; charset="utf-8"
-
-{text or ""}
-"""
+        body = text
+        content_type = 'text/plain; charset="utf-8"'
 
     headers = []
     headers.append(f"From: {frm}")
@@ -572,13 +569,14 @@ def _build_eml(metadata: Dict[str, Any]) -> Tuple[str, bytes, str]:
     if date:
         headers.append(f"Date: {date}")
     headers.append("MIME-Version: 1.0")
+    headers.append(f"Content-Type: {content_type}")
+    headers.append("Content-Transfer-Encoding: 8bit")
 
     raw = ("\r\n".join(headers) + "\r\n\r\n").encode("utf-8") + body.encode("utf-8")
     return file_name, raw, "message/rfc822"
 
 def materialize_bytes(meta: Dict[str, Any]) -> Tuple[str, bytes, str]:
     """
-    チケットの meta から (推奨ファイル名, バイト列, MIME) を作る
     meta["type"] ∈ {"text","base64","url","eml"}
     """
     mtype = (meta.get("type") or "text").lower()
@@ -594,7 +592,6 @@ def materialize_bytes(meta: Dict[str, Any]) -> Tuple[str, bytes, str]:
         try:
             data = base64.b64decode(b64, validate=True)
         except Exception:
-            # 末尾改行等で失敗しがちなので緩めに
             data = base64.b64decode(b64)
         return file_name, data, mime
 
@@ -604,19 +601,15 @@ def materialize_bytes(meta: Dict[str, Any]) -> Tuple[str, bytes, str]:
             raise ValueError("url type requires href")
         r = requests.get(href, timeout=60)
         r.raise_for_status()
-        # Content-Type 優先
         cm = r.headers.get("content-type")
         if cm:
             mime = cm.split(";")[0].strip()
-        # ファイル名推定は最低限（Content-Disposition未対応）
         return file_name, r.content, mime
 
     if mtype == "eml":
-        # EMLを生成
         fname, raw, mime2 = _build_eml(meta)
         return fname, raw, mime2
 
-    # 未知はテキストと見なす
     data_str = meta.get("data") or ""
     return file_name, data_str.encode("utf-8"), mime
 
@@ -652,21 +645,18 @@ def _extract_first_excel_from_msg(msg_bytes: bytes):
 # ===============================
 @app.get("/")
 def index():
-    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-28"})
+    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29"})
 
 @app.get("/front")
 def serve_front():
-    # onedrive.html を templates で管理してる場合は send_from_directory で静的返却でもOK
-    # ここでは /templates 直返し
     return send_from_directory(app.template_folder, "onedrive.html")
 
 @app.get("/picker-redirect.html")
 def picker_redirect():
-    # OneDrive Picker 用の空HTML
     return "<!doctype html><meta charset='utf-8'><title>close</title>OK"
 
 # ===============================
-# API：チケット作成 / 参照
+# API：チケット作成 / 参照 / ダウンロード（個人用）
 # ===============================
 @app.post("/tickets/create")
 def tickets_create():
@@ -679,8 +669,7 @@ def tickets_create():
         "data": "...",       # text/base64
         "href": "https://",  # url
         "payload": {...},    # eml用
-        "ttlSec": 600,
-        "once": true|false
+        "ttlSec": 600
       }
     """
     try:
@@ -688,7 +677,6 @@ def tickets_create():
         if not j:
             return jsonify({"error": "empty_body"}), 400
 
-        # 正規化
         mtype = (j.get("type") or "text").lower()
         meta = {
             "type": mtype,
@@ -717,14 +705,80 @@ def tickets_peek():
     if not t:
         return jsonify({"error": "ticket_not_found_or_expired"}), 404
     meta = t.meta
-    # eml の場合は .eml を補う
     fn = meta.get("fileName") or "download.bin"
     if (meta.get("type") or "").lower() == "eml" and not fn.lower().endswith(".eml"):
         fn = fn + ".eml"
     return jsonify({"fileName": fn, "type": meta.get("type") or "text", "expiresAt": t.expires_at})
 
+@app.get("/tickets/download")
+def tickets_download():
+    """
+    個人 OneDrive 用：チケット内容を実体ファイルで返す
+    GET /tickets/download?ticket=...
+    """
+    tid = request.args.get("ticket", "")
+    if not tid:
+        return jsonify({"error": "missing ticket"}), 400
+    try:
+        meta = redeem_ticket(tid, consume=False)  # 個人saveで複数回使えるよう非消費
+        file_name, data_bytes, mime = materialize_bytes(meta)
+        if (meta.get("type") or "").lower() == "eml" and not file_name.lower().endswith(".eml"):
+            file_name += ".eml"
+        safe = _sanitize_name(file_name)
+        resp = app.response_class(response=data_bytes, status=200, mimetype=mime or "application/octet-stream")
+        resp.headers["Content-Disposition"] = f'attachment; filename="{safe}"'
+        resp.headers["Content-Length"] = str(len(data_bytes))
+        return resp
+    except KeyError:
+        return jsonify({"error": "ticket_not_found_or_expired"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
 # ===============================
-# API：OneDrive メタ
+# API：.msg → Excel を ticket 化（個人向け save 用）
+# ===============================
+@app.post("/api/msg-to-xlsx-ticket")
+def api_msg_to_xlsx_ticket():
+    """
+    form-data/json:
+      ticket: .msg を指す ticket
+      fileName: 任意（上書き名）
+    -> {"ticket": "<xlsx用の新ticket>"}
+    """
+    try:
+        if request.is_json:
+            t = (request.json or {}).get("ticket")
+            name_ovr = (request.json or {}).get("fileName")
+        else:
+            t = request.values.get("ticket")
+            name_ovr = request.values.get("fileName")
+
+        if not t:
+            return jsonify({"error": "missing ticket"}), 400
+
+        meta = redeem_ticket(t, consume=False)
+        _, msg_bytes, _ = materialize_bytes(meta)
+        hit = _extract_first_excel_from_msg(msg_bytes)
+        if not hit:
+            return jsonify({"error": "no_excel_attachment_found"}), 400
+
+        att_name, att_bytes, att_mime = hit
+        save_name = (name_ovr or att_name or "attachment.xlsx").strip()
+        if not save_name.lower().endswith((".xlsx", ".xlsm", ".xls", ".csv")):
+            save_name += ".xlsx"
+
+        new_tid = save_ticket({
+            "type": "base64",
+            "fileName": save_name,
+            "mime": att_mime or "application/octet-stream",
+            "data": base64.b64encode(att_bytes).decode("ascii")
+        }, ttl=DEFAULT_TICKET_TTL)
+        return jsonify({"ticket": new_tid})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+# ===============================
+# API：（組織用）OneDrive メタ
 # ===============================
 @app.get("/api/drive/item")
 def api_drive_item():
@@ -740,13 +794,13 @@ def api_drive_item():
         return jsonify({"error": str(e)}), 400
 
 # ===============================
-# API：アップロード（汎用：ticket 1件）
+# API：（組織用）アップロード（汎用：ticket 1件）
 # ===============================
 @app.post("/api/upload")
 def api_upload():
     """
     form-data:
-      ticket   : チケットID（text/base64/url/eml どれでもOK）
+      ticket   : チケットID（text/base64/url/eml）
       folderId : 保存先フォルダの item.id
       fileName : 任意（上書き）
     """
@@ -782,15 +836,15 @@ def api_upload():
         return jsonify({"error": str(e)}), 400
 
 # ===============================
-# API：.msg → Excel 抽出アップロード（新規）
+# API：（組織用）.msg → Excel 抽出アップロード
 # ===============================
 @app.post("/api/upload-msg-xlsx")
 def api_upload_msg_xlsx():
     """
     form-data:
-      ticket   : .msg を指すチケット（type: base64/url/text いずれもOK）
+      ticket   : .msg を指すチケット（type: base64/url/text いずれも可）
       folderId : 保存先フォルダの item.id
-      fileName : 任意（保存名上書き。拡張子含む / 空なら添付名を使う）
+      fileName : 任意（保存名上書き。拡張子含む / 空なら添付名）
     """
     try:
         ticket   = request.form.get("ticket")
@@ -800,10 +854,7 @@ def api_upload_msg_xlsx():
         if not ticket or not folderId:
             return jsonify({"error": "missing parameters"}), 400
 
-        # .msg 本体をバイト列へ
-        meta = redeem_ticket(ticket, consume=False)   # 抜き取り用途なので消費しない
-        # ただし原文も別で保存したい場合を想定して consume=False にしておく
-        # （原文不要なら True でよい）
+        meta = redeem_ticket(ticket, consume=False)  # 原文別保存も想定し非消費
         _, msg_bytes, _ = materialize_bytes(meta)
 
         hit = _extract_first_excel_from_msg(msg_bytes)
@@ -839,3 +890,4 @@ def api_upload_msg_xlsx():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
