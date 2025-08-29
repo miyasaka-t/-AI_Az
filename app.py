@@ -645,7 +645,7 @@ def _extract_first_excel_from_msg(msg_bytes: bytes):
 # ===============================
 @app.get("/")
 def index():
-    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29"})
+    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29-batch"})
 
 @app.get("/front")
 def serve_front():
@@ -702,59 +702,101 @@ def tickets_create():
 def tickets_create_multipart():
     """
     form-data:
-      file      : (任意) アップロードされた生ファイル。ある場合は base64 チケットを作る
-      metadata  : (任意) JSON文字列。type='eml' 等なら file なしでも作れる
-        例:
-          { "type":"eml", "fileName":"X", "payload":{...}, "ttlSec":600 }
-          { "type":"base64", "fileName":"Y", "data":"...base64...", "ttlSec":600 }
-          { "type":"url", "fileName":"Z", "href":"https://...", "ttlSec":600 }
-    戻り値: {"ticket":"..."}
+      file      : (任意) アップロードファイル。あれば base64 チケット（=原文）を作成
+      metadata  : (任意) JSON文字列。type='eml' 等なら file 無しでも作成可
+                   追加オプション:
+                     extractXlsx: true  # file(.msg)がある時、最初のExcelを抽出→別ticketも返す
+                     fileName: 上書き保存名
+                     mime:     明示したい場合に指定
+                     ttlSec:   TTL 秒
+                     xlsxFileName: 抽出Excelの保存名（任意）
+    戻り:
+      - 1つだけ作成 → {"ticket":"..."}  （後方互換）
+      - 複数作成     → {
+            "ok": true,
+            "tickets": {
+               "file": "<msg等の原文ticket> or null",
+               "metadata": "<metadata由来のticket> or null",
+               "xlsxFromMsg": "<.msg内Excelのticket> or null"
+            }
+         }
     """
     try:
         meta_text = request.form.get("metadata", "") or ""
         meta_json = json.loads(meta_text) if meta_text.strip() else {}
 
+        ttl = int(meta_json.get("ttlSec") or DEFAULT_TICKET_TTL)
+
+        made_file_ticket = None
+        made_meta_ticket = None
+        made_xlsx_ticket = None
+
         f = request.files.get("file")
+        raw = None
+
         if f:
-            # ファイルが来た → base64 チケットを作成
             raw = f.read()
             up_name = getattr(f, "filename", None) or "upload.bin"
-            file_name = (meta_json.get("fileName") or up_name or "upload.bin").strip() or "upload.bin"
-            mime = (
+            file_name_for_file = (meta_json.get("fileName") or up_name or "upload.bin").strip() or "upload.bin"
+            file_mime_for_file = (
                 meta_json.get("mime")
                 or f.mimetype
-                or mimetypes.guess_type(file_name)[0]
+                or mimetypes.guess_type(file_name_for_file)[0]
                 or "application/octet-stream"
             )
-            tid = save_ticket({
+            made_file_ticket = save_ticket({
                 "type": "base64",
-                "fileName": file_name,
-                "mime": mime,
+                "fileName": file_name_for_file,
+                "mime": file_mime_for_file,
                 "data": base64.b64encode(raw).decode("ascii"),
-            }, ttl=int(meta_json.get("ttlSec") or DEFAULT_TICKET_TTL))
-            return jsonify({"ticket": tid})
+            }, ttl=ttl)
 
-        # ファイル無し → metadata のみで作成
-        if not meta_json:
-            return jsonify({"error":"missing file and metadata"}), 400
+        if meta_json:
+            mtype = (meta_json.get("type") or "text").lower()
+            meta = {
+                "type": mtype,
+                "fileName": meta_json.get("fileName") or "download.bin",
+                "mime": meta_json.get("mime"),
+            }
+            if mtype in ("text", "base64"):
+                meta["data"] = meta_json.get("data") or ""
+            elif mtype == "url":
+                meta["href"] = meta_json.get("href") or ""
+            elif mtype == "eml":
+                meta["payload"] = meta_json.get("payload") or {}
+            else:
+                meta["data"] = meta_json.get("data") or ""
 
-        mtype = (meta_json.get("type") or "text").lower()
-        meta = {
-            "type": mtype,
-            "fileName": meta_json.get("fileName") or "download.bin",
-            "mime": meta_json.get("mime"),
-        }
-        if mtype in ("text", "base64"):
-            meta["data"] = meta_json.get("data") or ""
-        elif mtype == "url":
-            meta["href"] = meta_json.get("href") or ""
-        elif mtype == "eml":
-            meta["payload"] = meta_json.get("payload") or {}
-        else:
-            meta["data"] = meta_json.get("data") or ""
+            made_meta_ticket = save_ticket(meta, ttl=ttl)
 
-        tid = save_ticket(meta, ttl=int(meta_json.get("ttlSec") or DEFAULT_TICKET_TTL))
-        return jsonify({"ticket": tid})
+        # 追加: .msg ファイルがあり、extractXlsx 指定なら Excel 抽出して別ticket
+        if f and raw is not None and meta_json.get("extractXlsx"):
+            hit = _extract_first_excel_from_msg(raw)
+            if hit:
+                att_name, att_bytes, att_mime = hit
+                save_name = (meta_json.get("xlsxFileName") or att_name or "attachment.xlsx").strip()
+                if not save_name.lower().endswith((".xlsx", ".xlsm", ".xls", ".csv")):
+                    save_name += ".xlsx"
+                made_xlsx_ticket = save_ticket({
+                    "type": "base64",
+                    "fileName": save_name,
+                    "mime": att_mime or "application/octet-stream",
+                    "data": base64.b64encode(att_bytes).decode("ascii")
+                }, ttl=ttl)
+
+        # 後方互換：作成数が1つだけなら {"ticket": "..."} を返す
+        created = [t for t in [made_file_ticket, made_meta_ticket, made_xlsx_ticket] if t]
+        if len(created) == 1:
+            return jsonify({"ticket": created[0]})
+
+        return jsonify({
+            "ok": True,
+            "tickets": {
+                "file": made_file_ticket,
+                "metadata": made_meta_ticket,
+                "xlsxFromMsg": made_xlsx_ticket
+            }
+        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -951,5 +993,6 @@ def api_upload_msg_xlsx():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
 
 
