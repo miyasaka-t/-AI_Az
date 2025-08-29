@@ -351,7 +351,7 @@
 
 # ============================================
 
-# app.py
+# app.py — personal(org)両対応・フル版
 import os, io, re, json, time, base64, mimetypes, tempfile
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
@@ -360,35 +360,121 @@ from werkzeug.utils import secure_filename
 import requests
 from urllib.parse import quote
 
-# （必要なら CORS を有効化）
-# from flask_cors import CORS
-
-# ===============================
-# 設定（環境変数）
-# ===============================
-TENANT_ID      = os.getenv("AZ_TENANT_ID", "")
-CLIENT_ID      = os.getenv("AZ_CLIENT_ID", "")
-CLIENT_SECRET  = os.getenv("AZ_CLIENT_SECRET", "")
-TARGET_USER_ID = os.getenv("TARGET_USER_ID", "")  # アプリ権限時は /users/{id} 必須
-
-GRAPH_BASE   = "https://graph.microsoft.com/v1.0"
-GRAPH_SCOPE  = "https://graph.microsoft.com/.default"
-
-# アップロード閾値
-SMALL_MAX_BYTES = 250 * 1024 * 1024  # 250MB
-CHUNK_SIZE      = 5 * 1024 * 1024    # 5MB
-
-# チケットの有効期限（秒）
-DEFAULT_TICKET_TTL = 600
-
 # ===============================
 # Flask
 # ===============================
 app = Flask(__name__, static_folder="static", template_folder="templates")
-# CORS(app)
 
 # ===============================
-# 簡易チケットストア（メモリ）
+# 環境変数（組織 / アプリ権限）
+# ===============================
+TENANT_ID      = os.getenv("AZ_TENANT_ID", "")
+CLIENT_ID_ORG  = os.getenv("AZ_CLIENT_ID", "")
+CLIENT_SECRET_ORG = os.getenv("AZ_CLIENT_SECRET", "")
+TARGET_USER_ID = os.getenv("TARGET_USER_ID", "")  # /users/{id} の id
+
+GRAPH_BASE   = "https://graph.microsoft.com/v1.0"
+GRAPH_SCOPE  = "https://graph.microsoft.com/.default"
+
+SMALL_MAX_BYTES = 250 * 1024 * 1024  # 250MB
+CHUNK_SIZE      = 5 * 1024 * 1024    # 5MB
+
+DEFAULT_TICKET_TTL = 600
+
+# ===============================
+# 環境変数（個人 / 委任トークン）
+# ===============================
+PERSONAL_CLIENT_ID     = os.getenv("PERSONAL_CLIENT_ID") or os.getenv("AZURE_CLIENT_ID") or os.getenv("CLIENT_ID") or ""
+PERSONAL_CLIENT_SECRET = os.getenv("PERSONAL_CLIENT_SECRET") or os.getenv("AZURE_CLIENT_SECRET") or os.getenv("CLIENT_SECRET") or ""
+PERSONAL_TENANT        = os.getenv("AZURE_TENANT", "consumers")  # 個人は "consumers"
+# 既知の公開URLがあればそれを使う
+_public = (os.getenv("PUBLIC_URL") or "").rstrip("/")
+_personal_cb_fallback = (_public + "/callback") if _public else "https://example.com/callback"
+PERSONAL_REDIRECT_URI  = os.getenv("PERSONAL_REDIRECT_URI") or os.getenv("AZURE_REDIRECT_URI") or _personal_cb_fallback
+
+AUTHZ_URL  = f"https://login.microsoftonline.com/{PERSONAL_TENANT}/oauth2/v2.0/authorize"
+TOKEN_URL  = f"https://login.microsoftonline.com/{PERSONAL_TENANT}/oauth2/v2.0/token"
+SCOPE      = "offline_access Files.ReadWrite"
+
+TOKENS = {
+    "access_token": None,
+    "refresh_token": os.getenv("REFRESH_TOKEN"),  # Render等の環境変数に保存しておく
+    "exp": 0
+}
+
+def _save_tokens(j: dict):
+    TOKENS["access_token"] = j.get("access_token")
+    if j.get("refresh_token"):
+        TOKENS["refresh_token"] = j.get("refresh_token")
+    TOKENS["exp"] = time.time() + int(j.get("expires_in", 3600)) - 60
+
+def _need_refresh() -> bool:
+    return (not TOKENS["access_token"]) or (time.time() >= TOKENS["exp"])
+
+def refresh_if_needed():
+    """個人: REFRESH_TOKENからアクセストークンを更新"""
+    if not _need_refresh():
+        return
+    if not TOKENS["refresh_token"]:
+        raise RuntimeError("Not authenticated for personal mode. Set REFRESH_TOKEN or visit /login")
+    data = {
+        "client_id": PERSONAL_CLIENT_ID,
+        "client_secret": PERSONAL_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": TOKENS["refresh_token"],
+        "redirect_uri": PERSONAL_REDIRECT_URI,
+    }
+    r = requests.post(TOKEN_URL, data=data, timeout=30)
+    r.raise_for_status()
+    _save_tokens(r.json())
+
+# ===============================
+# OAuth（個人）
+# ===============================
+@app.get("/login")
+def login():
+    url = (
+        f"{AUTHZ_URL}?client_id={PERSONAL_CLIENT_ID}"
+        f"&response_type=code"
+        f"&redirect_uri={quote(PERSONAL_REDIRECT_URI, safe='')}"
+        f"&scope={quote(SCOPE, safe=' ')}"
+        f"&prompt=select_account"
+        f"&domain_hint=consumers"
+    )
+    return f'<a href="{url}">Sign in with Microsoft (personal)</a>'
+
+@app.get("/callback")
+def callback():
+    code = request.args.get("code", "")
+    if not code:
+        return "missing code", 400
+    data = {
+        "client_id": PERSONAL_CLIENT_ID,
+        "client_secret": PERSONAL_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": PERSONAL_REDIRECT_URI,
+    }
+    r = requests.post(TOKEN_URL, data=data, timeout=30)
+    if not r.ok:
+        return f"OAuth error: {r.status_code} {r.text}", 400
+    token_info = r.json()
+    _save_tokens(token_info)
+    rt = token_info.get("refresh_token", "")
+    html = f"""
+    <h3>OAuth OK (personal)</h3>
+    <p>環境変数 <code>REFRESH_TOKEN</code> に以下の値を保存してください（再起動推奨）。</p>
+    <pre style="white-space: pre-wrap;">{rt}</pre>
+    """
+    return html, 200
+
+@app.get("/logout")
+def logout():
+    TOKENS.update({"access_token": None, "refresh_token": None, "exp": 0})
+    return jsonify({"ok": True})
+
+# ===============================
+# チケット（メモリ）
 # ===============================
 @dataclass
 class Ticket:
@@ -402,7 +488,6 @@ def _now() -> float:
     return time.time()
 
 def _gen_ticket_id(n: int = 24) -> str:
-    # 簡易ID（URLセーフ）
     return base64.urlsafe_b64encode(os.urandom(n)).decode("ascii").rstrip("=")
 
 def _cleanup_tickets():
@@ -422,9 +507,6 @@ def get_ticket(tid: str) -> Optional[Ticket]:
     return _TICKETS.get(tid)
 
 def redeem_ticket(tid: str, consume: bool = True) -> Dict[str, Any]:
-    """
-    チケットを取得（必要なら消費）。見つからなければ KeyError。
-    """
     t = get_ticket(tid)
     if not t:
         raise KeyError("ticket_not_found_or_expired")
@@ -434,93 +516,12 @@ def redeem_ticket(tid: str, consume: bool = True) -> Dict[str, Any]:
     return meta
 
 # ===============================
-# Graph 認証＆ヘッダ（組織用）
+# 共通ユーティリティ
 # ===============================
-def get_app_token() -> str:
-    if not (TENANT_ID and CLIENT_ID and CLIENT_SECRET):
-        raise RuntimeError("Graph app-only requires AZ_TENANT_ID/CLIENT_ID/CLIENT_SECRET")
-    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-    data = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "scope": GRAPH_SCOPE,
-        "grant_type": "client_credentials",
-    }
-    r = requests.post(url, data=data, timeout=30)
-    r.raise_for_status()
-    return r.json()["access_token"]
-
-def gheaders(token: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    h = {"Authorization": f"Bearer {token}"}
-    if extra:
-        h.update(extra)
-    return h
-
-# ===============================
-# OneDrive（組織: /users/{id}/drive）
-# ===============================
-def _user_drive_root() -> str:
-    if not TARGET_USER_ID:
-        raise RuntimeError("TARGET_USER_ID is required for app-only Graph calls")
-    return f"{GRAPH_BASE}/users/{TARGET_USER_ID}/drive"
-
-def graph_get_item_meta(item_id: str) -> Dict[str, Any]:
-    token = get_app_token()
-    url = f"{_user_drive_root()}/items/{item_id}"
-    r = requests.get(url, headers=gheaders(token), timeout=30)
-    r.raise_for_status()
-    return r.json()
-
 def _sanitize_name(name: str) -> str:
     safe = (name or "upload.bin").replace("/", "_").replace("\\", "_").strip()
     return safe or "upload.bin"
 
-def graph_put_small_to_folder(folder_id: str, name: str, mime: str, data: bytes) -> requests.Response:
-    """
-    親フォルダID配下に name をアップロード（<= SMALL_MAX_BYTES）
-    PUT /users/{id}/drive/items/{parent-id}:/{name}:/content
-    """
-    token = get_app_token()
-    safe_name = _sanitize_name(name)
-    url = f"{_user_drive_root()}/items/{folder_id}:/{safe_name}:/content"
-    return requests.put(url, headers=gheaders(token, {"Content-Type": mime or "application/octet-stream"}),
-                        data=data, timeout=300)
-
-def graph_create_upload_session(folder_id: str, name: str) -> str:
-    """
-    大きいファイル用Upload Session
-    POST /users/{id}/drive/items/{parent-id}:/{name}:/createUploadSession
-    """
-    token = get_app_token()
-    safe_name = _sanitize_name(name)
-    url = f"{_user_drive_root()}/items/{folder_id}:/{safe_name}:/createUploadSession"
-    r = requests.post(url, headers=gheaders(token, {"Content-Type": "application/json"}), json={}, timeout=60)
-    r.raise_for_status()
-    up = r.json()
-    return up["uploadUrl"]
-
-def graph_put_chunked_to_folder(folder_id: str, name: str, data: bytes) -> requests.Response:
-    upload_url = graph_create_upload_session(folder_id, name)
-    size = len(data)
-    off = 0
-    while off < size:
-        chunk = data[off: off + CHUNK_SIZE]
-        start = off
-        end = off + len(chunk) - 1
-        headers = {
-            "Content-Length": str(len(chunk)),
-            "Content-Range": f"bytes {start}-{end}/{size}",
-            "Content-Type": "application/octet-stream",
-        }
-        r = requests.put(upload_url, headers=headers, data=chunk, timeout=600)
-        if r.status_code not in (200, 201, 202):
-            r.raise_for_status()
-        off += len(chunk)
-    return r
-
-# ===============================
-# チケット -> 実バイト列生成
-# ===============================
 def _to_str(v: Any) -> str:
     if v is None:
         return ""
@@ -615,39 +616,116 @@ def materialize_bytes(meta: Dict[str, Any]) -> Tuple[str, bytes, str]:
     return file_name, data_str.encode("utf-8"), mime
 
 # ===============================
-# .msg から Excel 添付抽出
+# OneDrive（組織: /users/{id}/drive）
 # ===============================
-def _extract_first_excel_from_msg(msg_bytes: bytes):
-    """
-    .msgバイナリから最初の Excel(CSV含む) を抽出
-    戻り値: (filename, data_bytes, mime) / None
-    """
-    import extract_msg  # pip install extract-msg
-    with tempfile.NamedTemporaryFile(suffix=".msg", delete=True) as tmp:
-        tmp.write(msg_bytes)
-        tmp.flush()
-        m = extract_msg.Message(tmp.name)
-        for att in m.attachments:
-            fname = getattr(att, "longFilename", None) or getattr(att, "shortFilename", None) or "attachment"
-            lower = fname.lower()
-            if lower.endswith((".xlsx", ".xlsm", ".xls", ".csv")):
-                data = att.data
-                mime = (
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if lower.endswith(".xlsx") else
-                    "application/vnd.ms-excel" if lower.endswith((".xls", ".xlsm")) else
-                    "text/csv" if lower.endswith(".csv") else
-                    mimetypes.guess_type(fname)[0] or "application/octet-stream"
-                )
-                return fname, data, mime
-    return None
+def get_app_token() -> str:
+    if not (TENANT_ID and CLIENT_ID_ORG and CLIENT_SECRET_ORG):
+        raise RuntimeError("Graph app-only requires AZ_TENANT_ID/AZ_CLIENT_ID/AZ_CLIENT_SECRET")
+    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    data = {
+        "client_id": CLIENT_ID_ORG,
+        "client_secret": CLIENT_SECRET_ORG,
+        "scope": GRAPH_SCOPE,
+        "grant_type": "client_credentials",
+    }
+    r = requests.post(url, data=data, timeout=30)
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def gheaders(token: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    h = {"Authorization": f"Bearer {token}"}
+    if extra:
+        h.update(extra)
+    return h
+
+def _user_drive_root() -> str:
+    if not TARGET_USER_ID:
+        raise RuntimeError("TARGET_USER_ID is required for app-only Graph calls")
+    return f"{GRAPH_BASE}/users/{TARGET_USER_ID}/drive"
+
+def graph_get_item_meta(item_id: str) -> Dict[str, Any]:
+    token = get_app_token()
+    url = f"{_user_drive_root()}/items/{item_id}"
+    r = requests.get(url, headers=gheaders(token), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def graph_put_small_to_folder_org(folder_id: str, name: str, mime: str, data: bytes) -> requests.Response:
+    token = get_app_token()
+    safe_name = _sanitize_name(name)
+    url = f"{_user_drive_root()}/items/{folder_id}:/{safe_name}:/content"
+    return requests.put(url, headers=gheaders(token, {"Content-Type": mime or "application/octet-stream"}),
+                        data=data, timeout=300)
+
+def graph_create_upload_session_org(folder_id: str, name: str) -> str:
+    token = get_app_token()
+    safe_name = _sanitize_name(name)
+    url = f"{_user_drive_root()}/items/{folder_id}:/{safe_name}:/createUploadSession"
+    r = requests.post(url, headers=gheaders(token, {"Content-Type": "application/json"}), json={}, timeout=60)
+    r.raise_for_status()
+    return r.json()["uploadUrl"]
+
+def graph_put_chunked_to_folder_org(folder_id: str, name: str, data: bytes) -> requests.Response:
+    upload_url = graph_create_upload_session_org(folder_id, name)
+    size = len(data); off = 0; last = None
+    while off < size:
+        chunk = data[off: off + CHUNK_SIZE]
+        start = off; end = off + len(chunk) - 1
+        headers = {
+            "Content-Length": str(len(chunk)),
+            "Content-Range": f"bytes {start}-{end}/{size}",
+            "Content-Type": "application/octet-stream",
+        }
+        last = requests.put(upload_url, headers=headers, data=chunk, timeout=600)
+        if last.status_code not in (200, 201, 202):
+            break
+        off += len(chunk)
+    return last
 
 # ===============================
-# ルーティング：静的ページ
+# OneDrive（個人: /me/drive）
+# ===============================
+def graph_put_small_to_folder_personal(folder_id: str, name: str, mime: str, data: bytes) -> requests.Response:
+    refresh_if_needed()
+    safe_name = _sanitize_name(name)
+    url = f"{GRAPH_BASE}/me/drive/items/{folder_id}:/{safe_name}:/content"
+    return requests.put(url, headers={
+        "Authorization": f"Bearer {TOKENS['access_token']}",
+        "Content-Type": mime or "application/octet-stream"
+    }, data=data, timeout=300)
+
+def graph_create_upload_session_personal(folder_id: str, name: str) -> str:
+    refresh_if_needed()
+    safe_name = _sanitize_name(name)
+    url = f"{GRAPH_BASE}/me/drive/items/{folder_id}:/{safe_name}:/createUploadSession"
+    r = requests.post(url, headers={"Authorization": f"Bearer {TOKENS['access_token']}", "Content-Type": "application/json"},
+                      json={}, timeout=60)
+    r.raise_for_status()
+    return r.json()["uploadUrl"]
+
+def graph_put_chunked_to_folder_personal(folder_id: str, name: str, data: bytes) -> requests.Response:
+    upload_url = graph_create_upload_session_personal(folder_id, name)
+    size = len(data); off = 0; last = None
+    while off < size:
+        chunk = data[off: off + CHUNK_SIZE]
+        start = off; end = off + len(chunk) - 1
+        headers = {
+            "Content-Length": str(len(chunk)),
+            "Content-Range": f"bytes {start}-{end}/{size}",
+            "Content-Type": "application/octet-stream",
+        }
+        last = requests.put(upload_url, headers=headers, data=chunk, timeout=600)
+        if last.status_code not in (200, 201, 202):
+            break
+        off += len(chunk)
+    return last
+
+# ===============================
+# ルーティング：静的/フロント
 # ===============================
 @app.get("/")
 def index():
-    # バージョンで新コード稼働確認
-    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29-batch-multi-fixed2"})
+    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29-personal-org-unified"})
 
 @app.get("/front")
 def serve_front():
@@ -658,7 +736,7 @@ def picker_redirect():
     return "<!doctype html><meta charset='utf-8'><title>close</title>OK"
 
 # ===============================
-# API：チケット作成 / 参照 / ダウンロード（個人用）
+# API：チケット作成 / 参照 / ダウンロード（個人save用）
 # ===============================
 @app.post("/tickets/create")
 def tickets_create():
@@ -712,7 +790,6 @@ def tickets_create_multipart():
     戻り: {"ok":true,"tickets":{"file":..., "metadata":..., "xlsxFromMsg":...}}
     """
     try:
-        # 1) metadata を form テキスト → files → 別名 の順で救済的に読む
         meta_text = request.form.get("metadata", "") or ""
         if not meta_text and "metadata" in request.files:
             try:
@@ -723,14 +800,13 @@ def tickets_create_multipart():
             meta_text = request.form.get("meta", "") or request.form.get("metadata_json", "") or ""
 
         meta_json = {}
-        if meta_text and meta_text.strip():
+        if meta_text.strip():
             try:
                 meta_json = json.loads(meta_text)
             except Exception:
                 print("[create-multipart] WARN: metadata JSON parse failed")
                 meta_json = {}
 
-        # 簡易ログ（Renderのログで確認用）
         print("[create-multipart] has_file=", bool(request.files.get("file")))
         print("[create-multipart] meta_json_keys=", list(meta_json.keys()) if meta_json else [])
         print("[create-multipart] extractXlsx=", meta_json.get("extractXlsx") if meta_json else None)
@@ -744,7 +820,6 @@ def tickets_create_multipart():
         f = request.files.get("file")
         raw = None
 
-        # 2) file → 原文ticket
         if f:
             raw = f.read()
             up_name = getattr(f, "filename", None) or "upload.bin"
@@ -762,7 +837,6 @@ def tickets_create_multipart():
                 "data": base64.b64encode(raw).decode("ascii"),
             }, ttl=ttl)
 
-        # 3) metadata → eml/text/url 等の ticket
         if meta_json:
             mtype = (meta_json.get("type") or "text").lower()
             meta = {
@@ -780,7 +854,6 @@ def tickets_create_multipart():
                 meta["data"] = meta_json.get("data") or ""
             made_meta_ticket = save_ticket(meta, ttl=ttl)
 
-        # 4) .msg → Excel 抽出（オプション）
         if f and raw is not None and meta_json.get("extractXlsx"):
             hit = _extract_first_excel_from_msg(raw)
             if hit:
@@ -795,16 +868,7 @@ def tickets_create_multipart():
                     "data": base64.b64encode(att_bytes).decode("ascii")
                 }, ttl=ttl)
 
-        # 常にまとめ形式で返す
-        return jsonify({
-            "ok": True,
-            "tickets": {
-                "file": made_file_ticket,
-                "metadata": made_meta_ticket,
-                "xlsxFromMsg": made_xlsx_ticket
-            }
-        })
-
+        return jsonify({"ok": True, "tickets": {"file": made_file_ticket, "metadata": made_meta_ticket, "xlsxFromMsg": made_xlsx_ticket}})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
@@ -822,15 +886,12 @@ def tickets_peek():
 
 @app.get("/tickets/download")
 def tickets_download():
-    """
-    個人 OneDrive 用：チケット内容を実体ファイルで返す
-    GET /tickets/download?ticket=...
-    """
+    """個人 OneDrive の save/sourceUri 用：実体ファイルで返す（消費しない）"""
     tid = request.args.get("ticket", "")
     if not tid:
         return jsonify({"error": "missing ticket"}), 400
     try:
-        meta = redeem_ticket(tid, consume=False)  # 個人saveで複数回使えるよう非消費
+        meta = redeem_ticket(tid, consume=False)
         file_name, data_bytes, mime = materialize_bytes(meta)
         if (meta.get("type") or "").lower() == "eml" and not file_name.lower().endswith(".eml"):
             file_name += ".eml"
@@ -846,53 +907,38 @@ def tickets_download():
         return jsonify({"error": str(e)}), 400
 
 # ===============================
-# API：.msg → Excel を ticket 化（個人向け save 用）
+# .msg → 最初のExcel抽出
 # ===============================
-@app.post("/api/msg-to-xlsx-ticket")
-def api_msg_to_xlsx_ticket():
+def _extract_first_excel_from_msg(msg_bytes: bytes):
     """
-    form-data/json:
-      ticket: .msg を指す ticket
-      fileName: 任意（上書き名）
-    -> {"ticket": "<xlsx用の新ticket>"}
+    .msgバイナリから最初の Excel(CSV含む) を抽出
+    戻り値: (filename, data_bytes, mime) / None
     """
-    try:
-        if request.is_json:
-            t = (request.json or {}).get("ticket")
-            name_ovr = (request.json or {}).get("fileName")
-        else:
-            t = request.values.get("ticket")
-            name_ovr = request.values.get("fileName")
-
-        if not t:
-            return jsonify({"error": "missing ticket"}), 400
-
-        meta = redeem_ticket(t, consume=False)
-        _, msg_bytes, _ = materialize_bytes(meta)
-        hit = _extract_first_excel_from_msg(msg_bytes)
-        if not hit:
-            return jsonify({"error": "no_excel_attachment_found"}), 400
-
-        att_name, att_bytes, att_mime = hit
-        save_name = (name_ovr or att_name or "attachment.xlsx").strip()
-        if not save_name.lower().endswith((".xlsx", ".xlsm", ".xls", ".csv")):
-            save_name += ".xlsx"
-
-        new_tid = save_ticket({
-            "type": "base64",
-            "fileName": save_name,
-            "mime": att_mime or "application/octet-stream",
-            "data": base64.b64encode(att_bytes).decode("ascii")
-        }, ttl=DEFAULT_TICKET_TTL)
-        return jsonify({"ticket": new_tid})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    import extract_msg  # pip install extract-msg
+    with tempfile.NamedTemporaryFile(suffix=".msg", delete=True) as tmp:
+        tmp.write(msg_bytes)
+        tmp.flush()
+        m = extract_msg.Message(tmp.name)
+        for att in m.attachments:
+            fname = getattr(att, "longFilename", None) or getattr(att, "shortFilename", None) or "attachment"
+            lower = fname.lower()
+            if lower.endswith((".xlsx", ".xlsm", ".xls", ".csv")):
+                data = att.data
+                mime = (
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if lower.endswith(".xlsx") else
+                    "application/vnd.ms-excel" if lower.endswith((".xls", ".xlsm")) else
+                    "text/csv" if lower.endswith(".csv") else
+                    mimetypes.guess_type(fname)[0] or "application/octet-stream"
+                )
+                return fname, data, mime
+    return None
 
 # ===============================
-# API：（組織用）OneDrive メタ
+# API：（組織）メタ取得/アップロード
 # ===============================
 @app.get("/api/drive/item")
 def api_drive_item():
+    """組織ドライブのアイテム名/webUrlを取得（フロント組織モードの表示用）"""
     item_id = request.args.get("id", "")
     if not item_id:
         return jsonify({"error": "missing id"}), 400
@@ -904,14 +950,11 @@ def api_drive_item():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-# ===============================
-# API：（組織用）アップロード（汎用：ticket 1件）
-# ===============================
 @app.post("/api/upload")
 def api_upload():
     """
-    form-data:
-      ticket   : チケットID（text/base64/url/eml）
+    組織: form-data
+      ticket   : チケットID
       folderId : 保存先フォルダの item.id
       fileName : 任意（上書き）
     """
@@ -929,9 +972,9 @@ def api_upload():
             file_name = name_ovr.strip() or file_name
 
         if len(data_bytes) <= SMALL_MAX_BYTES:
-            r = graph_put_small_to_folder(folderId, file_name, mime, data_bytes)
+            r = graph_put_small_to_folder_org(folderId, file_name, mime, data_bytes)
         else:
-            r = graph_put_chunked_to_folder(folderId, file_name, data_bytes)
+            r = graph_put_chunked_to_folder_org(folderId, file_name, data_bytes)
 
         if r.status_code in (200, 201):
             j = r.json()
@@ -939,23 +982,20 @@ def api_upload():
         else:
             return jsonify({"error": "graph_upload_failed", "status": r.status_code, "detail": r.text}), r.status_code
 
-    except KeyError as e:
-        return jsonify({"error": str(e)}), 404
+    except KeyError:
+        return jsonify({"error": "ticket_not_found_or_expired"}), 404
     except requests.HTTPError as e:
         return jsonify({"error": "graph_http_error", "status": e.response.status_code, "detail": e.response.text}), 502
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-# ===============================
-# API：（組織用）.msg → Excel 抽出アップロード
-# ===============================
 @app.post("/api/upload-msg-xlsx")
 def api_upload_msg_xlsx():
     """
-    form-data:
-      ticket   : .msg を指すチケット（type: base64/url/text いずれも可）
+    組織: form-data
+      ticket   : .msg を指すチケット
       folderId : 保存先フォルダの item.id
-      fileName : 任意（保存名上書き。拡張子含む / 空なら添付名）
+      fileName : 任意（保存名上書き）
     """
     try:
         ticket   = request.form.get("ticket")
@@ -965,7 +1005,7 @@ def api_upload_msg_xlsx():
         if not ticket or not folderId:
             return jsonify({"error": "missing parameters"}), 400
 
-        meta = redeem_ticket(ticket, consume=False)  # 原文別保存も想定し非消費
+        meta = redeem_ticket(ticket, consume=False)
         _, msg_bytes, _ = materialize_bytes(meta)
 
         hit = _extract_first_excel_from_msg(msg_bytes)
@@ -978,9 +1018,9 @@ def api_upload_msg_xlsx():
             save_name += ".xlsx"
 
         if len(att_bytes) <= SMALL_MAX_BYTES:
-            r = graph_put_small_to_folder(folderId, save_name, att_mime, att_bytes)
+            r = graph_put_small_to_folder_org(folderId, save_name, att_mime, att_bytes)
         else:
-            r = graph_put_chunked_to_folder(folderId, save_name, att_bytes)
+            r = graph_put_chunked_to_folder_org(folderId, save_name, att_bytes)
 
         if r.status_code in (200, 201):
             j = r.json()
@@ -988,8 +1028,48 @@ def api_upload_msg_xlsx():
         else:
             return jsonify({"error": "graph_upload_failed", "status": r.status_code, "detail": r.text}), r.status_code
 
-    except KeyError as e:
-        return jsonify({"error": str(e)}), 404
+    except KeyError:
+        return jsonify({"error": "ticket_not_found_or_expired"}), 404
+    except requests.HTTPError as e:
+        return jsonify({"error": "graph_http_error", "status": e.response.status_code, "detail": e.response.text}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+# ===============================
+# API：（個人）一括アップロード（フロントの /api/upload-personal 用）
+# ===============================
+@app.post("/api/upload-personal")
+def api_upload_personal():
+    """
+    個人: form-data
+      ticket   : チケットID
+      folderId : 保存先フォルダ (me/drive/items/{id})
+      fileName : 任意（上書き）
+    """
+    try:
+        ticket   = request.form.get("ticket")
+        folderId = request.form.get("folderId")
+        name_ovr = request.form.get("fileName")
+
+        if not ticket or not folderId:
+            return jsonify({"error": "missing parameters"}), 400
+
+        meta = redeem_ticket(ticket, consume=False)  # 個人は複数回の可能性→非消費
+        file_name, data_bytes, mime = materialize_bytes(meta)
+        if name_ovr:
+            file_name = name_ovr.strip() or file_name
+
+        if len(data_bytes) <= SMALL_MAX_BYTES:
+            r = graph_put_small_to_folder_personal(folderId, file_name, mime, data_bytes)
+        else:
+            r = graph_put_chunked_to_folder_personal(folderId, file_name, data_bytes)
+
+        if r.status_code in (200, 201):
+            j = r.json()
+            return jsonify({"ok": True, "id": j.get("id"), "webUrl": j.get("webUrl"), "name": j.get("name")})
+        else:
+            return jsonify({"error": "graph_upload_failed", "status": r.status_code, "detail": r.text}), r.status_code
+
     except requests.HTTPError as e:
         return jsonify({"error": "graph_http_error", "status": e.response.status_code, "detail": e.response.text}), 502
     except Exception as e:
@@ -1001,4 +1081,4 @@ def api_upload_msg_xlsx():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=True)
-    
+
