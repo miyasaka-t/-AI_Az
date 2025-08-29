@@ -358,8 +358,9 @@ from typing import Optional, Dict, Any, Tuple
 from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 import requests
+from urllib.parse import quote
 
-# （任意）個人/組織を跨ぐとき CORS を許可したい場合はコメントアウト解除
+# （必要なら CORS を有効化）
 # from flask_cors import CORS
 
 # ===============================
@@ -646,7 +647,7 @@ def _extract_first_excel_from_msg(msg_bytes: bytes):
 @app.get("/")
 def index():
     # バージョンで新コード稼働確認
-    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29-batch-multi-fixed"})
+    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29-batch-multi-fixed2"})
 
 @app.get("/front")
 def serve_front():
@@ -707,23 +708,27 @@ def tickets_create_multipart():
       metadata  : (任意) JSON文字列。type='eml' 等なら file 無しでも作成可
                    追加オプション:
                      extractXlsx: true  # file(.msg)がある時、最初のExcelを抽出→別ticketも返す
-                     fileName: 上書き保存名
-                     mime:     明示したい場合に指定
-                     ttlSec:   TTL 秒
-                     xlsxFileName: 抽出Excelの保存名（任意）
-    戻り: 常にまとめ形式
-      {
-        "ok": true,
-        "tickets": {
-          "file": "<msg等の原文ticket> or null",
-          "metadata": "<metadata由来のticket> or null",
-          "xlsxFromMsg": "<.msg内Excelのticket> or null"
-        }
-      }
+                     fileName, mime, ttlSec, xlsxFileName
+    戻り: {"ok":true,"tickets":{"file":..., "metadata":..., "xlsxFromMsg":...}}
     """
     try:
+        # 1) metadata を form テキスト → files → 別名 の順で救済的に読む
         meta_text = request.form.get("metadata", "") or ""
-        meta_json = json.loads(meta_text) if meta_text.strip() else {}
+        if not meta_text and "metadata" in request.files:
+            try:
+                meta_text = request.files["metadata"].read().decode("utf-8", errors="ignore")
+            except Exception:
+                meta_text = ""
+        if not meta_text:
+            meta_text = request.form.get("meta", "") or request.form.get("metadata_json", "") or ""
+
+        meta_json = {}
+        if meta_text and meta_text.strip():
+            try:
+                meta_json = json.loads(meta_text)
+            except Exception:
+                print("[create-multipart] WARN: metadata JSON parse failed")
+                meta_json = {}
 
         # 簡易ログ（Renderのログで確認用）
         print("[create-multipart] has_file=", bool(request.files.get("file")))
@@ -739,6 +744,7 @@ def tickets_create_multipart():
         f = request.files.get("file")
         raw = None
 
+        # 2) file → 原文ticket
         if f:
             raw = f.read()
             up_name = getattr(f, "filename", None) or "upload.bin"
@@ -756,6 +762,7 @@ def tickets_create_multipart():
                 "data": base64.b64encode(raw).decode("ascii"),
             }, ttl=ttl)
 
+        # 3) metadata → eml/text/url 等の ticket
         if meta_json:
             mtype = (meta_json.get("type") or "text").lower()
             meta = {
@@ -771,10 +778,9 @@ def tickets_create_multipart():
                 meta["payload"] = meta_json.get("payload") or {}
             else:
                 meta["data"] = meta_json.get("data") or ""
-
             made_meta_ticket = save_ticket(meta, ttl=ttl)
 
-        # 追加: .msg ファイルがあり、extractXlsx 指定なら Excel 抽出して別ticket
+        # 4) .msg → Excel 抽出（オプション）
         if f and raw is not None and meta_json.get("extractXlsx"):
             hit = _extract_first_excel_from_msg(raw)
             if hit:
@@ -829,8 +835,9 @@ def tickets_download():
         if (meta.get("type") or "").lower() == "eml" and not file_name.lower().endswith(".eml"):
             file_name += ".eml"
         safe = _sanitize_name(file_name)
+        disp = f"attachment; filename*=UTF-8''{quote(safe)}; filename=\"{safe}\""
         resp = app.response_class(response=data_bytes, status=200, mimetype=mime or "application/octet-stream")
-        resp.headers["Content-Disposition"] = f'attachment; filename="{safe}"'
+        resp.headers["Content-Disposition"] = disp
         resp.headers["Content-Length"] = str(len(data_bytes))
         return resp
     except KeyError:
@@ -994,8 +1001,4 @@ def api_upload_msg_xlsx():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=True)
-
-
-
-
-
+    
