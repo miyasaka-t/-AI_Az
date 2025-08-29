@@ -351,7 +351,7 @@
 
 # ============================================
 
-# app.py — personal(org)両対応・フル版
+# app.py — personal(org)両対応・/api/msg-to-xlsx-ticket追加版
 import os, io, re, json, time, base64, mimetypes, tempfile
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
@@ -387,7 +387,6 @@ DEFAULT_TICKET_TTL = 600
 PERSONAL_CLIENT_ID     = os.getenv("PERSONAL_CLIENT_ID") or os.getenv("AZURE_CLIENT_ID") or os.getenv("CLIENT_ID") or ""
 PERSONAL_CLIENT_SECRET = os.getenv("PERSONAL_CLIENT_SECRET") or os.getenv("AZURE_CLIENT_SECRET") or os.getenv("CLIENT_SECRET") or ""
 PERSONAL_TENANT        = os.getenv("AZURE_TENANT", "consumers")  # 個人は "consumers"
-# 既知の公開URLがあればそれを使う
 _public = (os.getenv("PUBLIC_URL") or "").rstrip("/")
 _personal_cb_fallback = (_public + "/callback") if _public else "https://example.com/callback"
 PERSONAL_REDIRECT_URI  = os.getenv("PERSONAL_REDIRECT_URI") or os.getenv("AZURE_REDIRECT_URI") or _personal_cb_fallback
@@ -398,7 +397,7 @@ SCOPE      = "offline_access Files.ReadWrite"
 
 TOKENS = {
     "access_token": None,
-    "refresh_token": os.getenv("REFRESH_TOKEN"),  # Render等の環境変数に保存しておく
+    "refresh_token": os.getenv("REFRESH_TOKEN"),
     "exp": 0
 }
 
@@ -725,7 +724,7 @@ def graph_put_chunked_to_folder_personal(folder_id: str, name: str, data: bytes)
 # ===============================
 @app.get("/")
 def index():
-    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29-personal-org-unified"})
+    return jsonify({"ok": True, "service": "onedrive-uploader", "version": "2025-08-29-personal-org-unified+msg2xlsx"})
 
 @app.get("/front")
 def serve_front():
@@ -934,6 +933,48 @@ def _extract_first_excel_from_msg(msg_bytes: bytes):
     return None
 
 # ===============================
+# 互換API: .msg → xlsx チケット作成（既存呼び先の404対策）
+# ===============================
+@app.post("/api/msg-to-xlsx-ticket")
+def api_msg_to_xlsx_ticket():
+    """
+    form-data:
+      ticket : .msg を指すチケットID（非消費）
+    戻り:
+      200: {"ok": true, "ticket": "<xlsx_ticket>", "fileName": "..."}
+    """
+    try:
+        msg_tid = request.form.get("ticket")
+        if not msg_tid:
+            return jsonify({"error": "missing ticket"}), 400
+
+        # .msg 実体（非消費）
+        meta = redeem_ticket(msg_tid, consume=False)
+        _, msg_bytes, _ = materialize_bytes(meta)
+
+        hit = _extract_first_excel_from_msg(msg_bytes)
+        if not hit:
+            return jsonify({"error": "no_excel_attachment_found"}), 400
+
+        att_name, att_bytes, att_mime = hit
+        save_name = (att_name or "attachment.xlsx").strip()
+        if not save_name.lower().endswith((".xlsx", ".xlsm", ".xls", ".csv")):
+            save_name += ".xlsx"
+
+        x_tid = save_ticket({
+            "type": "base64",
+            "fileName": save_name,
+            "mime": att_mime or "application/octet-stream",
+            "data": base64.b64encode(att_bytes).decode("ascii")
+        }, ttl=DEFAULT_TICKET_TTL)
+
+        return jsonify({"ok": True, "ticket": x_tid, "fileName": save_name})
+    except KeyError:
+        return jsonify({"error": "ticket_not_found_or_expired"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+# ===============================
 # API：（組織）メタ取得/アップロード
 # ===============================
 @app.get("/api/drive/item")
@@ -1081,4 +1122,5 @@ def api_upload_personal():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
 
