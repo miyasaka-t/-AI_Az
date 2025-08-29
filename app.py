@@ -698,6 +698,67 @@ def tickets_create():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+@app.post("/tickets/create-multipart")
+def tickets_create_multipart():
+    """
+    form-data:
+      file      : (任意) アップロードされた生ファイル。ある場合は base64 チケットを作る
+      metadata  : (任意) JSON文字列。type='eml' 等なら file なしでも作れる
+        例:
+          { "type":"eml", "fileName":"X", "payload":{...}, "ttlSec":600 }
+          { "type":"base64", "fileName":"Y", "data":"...base64...", "ttlSec":600 }
+          { "type":"url", "fileName":"Z", "href":"https://...", "ttlSec":600 }
+    戻り値: {"ticket":"..."}
+    """
+    try:
+        meta_text = request.form.get("metadata", "") or ""
+        meta_json = json.loads(meta_text) if meta_text.strip() else {}
+
+        f = request.files.get("file")
+        if f:
+            # ファイルが来た → base64 チケットを作成
+            raw = f.read()
+            up_name = getattr(f, "filename", None) or "upload.bin"
+            file_name = (meta_json.get("fileName") or up_name or "upload.bin").strip() or "upload.bin"
+            mime = (
+                meta_json.get("mime")
+                or f.mimetype
+                or mimetypes.guess_type(file_name)[0]
+                or "application/octet-stream"
+            )
+            tid = save_ticket({
+                "type": "base64",
+                "fileName": file_name,
+                "mime": mime,
+                "data": base64.b64encode(raw).decode("ascii"),
+            }, ttl=int(meta_json.get("ttlSec") or DEFAULT_TICKET_TTL))
+            return jsonify({"ticket": tid})
+
+        # ファイル無し → metadata のみで作成
+        if not meta_json:
+            return jsonify({"error":"missing file and metadata"}), 400
+
+        mtype = (meta_json.get("type") or "text").lower()
+        meta = {
+            "type": mtype,
+            "fileName": meta_json.get("fileName") or "download.bin",
+            "mime": meta_json.get("mime"),
+        }
+        if mtype in ("text", "base64"):
+            meta["data"] = meta_json.get("data") or ""
+        elif mtype == "url":
+            meta["href"] = meta_json.get("href") or ""
+        elif mtype == "eml":
+            meta["payload"] = meta_json.get("payload") or {}
+        else:
+            meta["data"] = meta_json.get("data") or ""
+
+        tid = save_ticket(meta, ttl=int(meta_json.get("ttlSec") or DEFAULT_TICKET_TTL))
+        return jsonify({"ticket": tid})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
 @app.get("/tickets/peek")
 def tickets_peek():
     tid = request.args.get("ticket", "")
@@ -890,4 +951,5 @@ def api_upload_msg_xlsx():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
 
